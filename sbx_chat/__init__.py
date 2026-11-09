@@ -3,6 +3,7 @@ Logic in core.py. The plugin keeps no session state: VM 130 owns the mapping of 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import time
 
@@ -10,6 +11,7 @@ from aiohttp.web import Request, Response
 from maubot import Plugin
 from maubot.handlers import event, web
 from mautrix.api import Method, Path
+from mautrix.crypto.attachments import decrypt_attachment
 from mautrix.types import EncryptedEvent, Event, EventType, Membership, MessageType, TextMessageEventContent
 from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
 
@@ -17,6 +19,7 @@ from . import core
 
 # The largest request: a text of core.TEXT_MAX plus the JSON around it.
 BODY_MAX = core.TEXT_MAX + 4 * 1024
+UNSUPPORTED = "Only text and images (PNG, JPEG, WebP, GIF, up to 10 MiB) are supported."
 ENCRYPTION = {"type": "m.room.encryption", "state_key": "", "content": {"algorithm": "m.megolm.v1.aes-sha2"}}
 
 
@@ -29,6 +32,7 @@ class Config(BaseProxyConfig):
 class SbxChat(Plugin):
     nonces: core.Nonces
     inbox: core.Inbox
+    media: core.MediaStore
     fresh: asyncio.Condition
     # Rooms this account made (or found to have made, after a restart): True or False per room ID.
     own_rooms: dict[str, bool]
@@ -41,6 +45,7 @@ class SbxChat(Plugin):
         self.config.load_and_update()
         self.nonces = core.Nonces()
         self.inbox = core.Inbox()
+        self.media = core.MediaStore()
         self.fresh = asyncio.Condition()
         self.own_rooms = {}
         if self._secret() is None:
@@ -119,6 +124,18 @@ class SbxChat(Plugin):
                     except asyncio.TimeoutError:
                         pass
             return self._reply(nonce, 200, reply)
+        except core.Refused as error:
+            return self._refused(error)
+
+    @web.post("/media")
+    async def media_endpoint(self, request: Request) -> Response:
+        """An image queued with an event, base64 in the answer, once: it is removed when served."""
+        try:
+            nonce, data = await self._read(request)
+            found = self.media.take(core.parse_media(data))
+            if found is None:
+                return self._reply(nonce, 404, {"error": "unknown image"})
+            return self._reply(nonce, 200, {"mime": found[0], "data": base64.b64encode(found[1]).decode()})
         except core.Refused as error:
             return self._refused(error)
 
@@ -205,7 +222,16 @@ class SbxChat(Plugin):
         # fetch the event as stored on the server: it counts only if it is m.room.encrypted there, and then only its
         # own decryption's body counts. A second decryption of the same event passes mautrix's replay check.
         content = await self._decrypted_content(evt.room_id, evt.event_id)
-        if content is None or core.is_edit(content) or content.get("msgtype") != "m.text":
+        if content is None or core.is_edit(content):
+            return
+        msgtype = content.get("msgtype")
+        if msgtype == "m.notice":
+            return
+        if msgtype == "m.image":
+            await self._on_image(evt, content)
+            return
+        if msgtype != "m.text":
+            await self._note(evt.room_id, UNSUPPORTED)
             return
         body = content.get("body")
         if not isinstance(body, str) or not body.strip():
@@ -215,6 +241,41 @@ class SbxChat(Plugin):
             return
         async with self.fresh:
             self.inbox.add(evt.room_id, body, evt.event_id)
+            self.fresh.notify_all()
+
+    async def _on_image(self, evt, content: dict) -> None:
+        """An image in a session room: decrypted here (the attachment is end-to-end encrypted, `content.file`), kept in
+        memory, and queued as an event the caller fetches through /media. Every refusal is a notice, never silence."""
+        room = evt.room_id
+        if room == self.config["room_id"]:
+            await self._note(room, "Images go into a session room.")
+            return
+        file, info = content.get("file"), content.get("info")
+        info = info if isinstance(info, dict) else {}
+        mime, size = info.get("mimetype"), info.get("size")
+        if not isinstance(file, dict) or not isinstance(file.get("url"), str):
+            # A plain `url` means the image sits unencrypted on the homeserver: not accepted.
+            await self._note(room, "Image ignored: it was not sent as an encrypted attachment.")
+            return
+        if mime not in core.IMAGE_MIMES:
+            await self._note(room, UNSUPPORTED)
+            return
+        if not isinstance(size, int) or isinstance(size, bool) or size > core.IMAGE_MAX:
+            await self._note(room, f"Image ignored: larger than {core.IMAGE_MAX // 1024 // 1024} MiB, or no size given.")
+            return
+        try:
+            cipher = await self.client.download_media(file["url"])
+            if len(cipher) > core.IMAGE_MAX:
+                await self._note(room, f"Image ignored: larger than {core.IMAGE_MAX // 1024 // 1024} MiB.")
+                return
+            data = decrypt_attachment(cipher, file["key"]["k"], file["hashes"]["sha256"], file["iv"])
+        except Exception:
+            self.log.exception("could not fetch or decrypt the image of %s", evt.event_id)
+            await self._note(room, "Image ignored: it could not be downloaded or decrypted.")
+            return
+        key = self.media.put(mime, data)
+        async with self.fresh:
+            self.inbox.add(room, core.caption_of(content), evt.event_id, {"id": key, "mime": mime, "size": len(data)})
             self.fresh.notify_all()
 
     @event.on(EventType.ROOM_MEMBER)

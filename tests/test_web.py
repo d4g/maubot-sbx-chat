@@ -4,6 +4,7 @@ Needs maubot (skipped without it): uv run --no-project --python 3.13 --with maub
 --with pytest-aiohttp pytest tests
 """
 import asyncio
+import base64
 import json
 import logging
 import pathlib
@@ -17,6 +18,7 @@ pytest.importorskip("maubot")
 from aiohttp import web  # noqa: E402
 from maubot.matrix import MaubotMessageEvent  # noqa: E402
 from maubot.plugin_server import PluginWebApp, PrefixResource  # noqa: E402
+from mautrix.crypto.attachments import encrypt_attachment  # noqa: E402
 from mautrix.types import Event, Membership  # noqa: E402
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
@@ -69,6 +71,7 @@ class FakeClient:
     def __init__(self):
         self.sent, self.created, self.left = [], [], []
         self.api, self.crypto = FakeApi(), FakeCrypto()
+        self.files = {}
         # Who created which room, as the state of the room says.
         self.creators = {SESSION: BOT, FOREIGN: OWNER}
 
@@ -91,6 +94,9 @@ class FakeClient:
         self.created.append(kwargs)
         return "!new:example.org"
 
+    async def download_media(self, url):
+        return self.files[url]
+
     async def leave_room(self, room):
         self.left.append(room)
 
@@ -102,6 +108,7 @@ def make_plugin():
     plugin.log = logging.getLogger("test")
     plugin.nonces = core.Nonces()
     plugin.inbox = core.Inbox()
+    plugin.media = core.MediaStore()
     plugin.fresh = asyncio.Condition()
     plugin.own_rooms = {}
     return plugin
@@ -283,3 +290,101 @@ async def test_matrix_failure_is_signed_502(setup):
     plugin.client.send_message = fail
     status, body, signed = await call(client, "/send", {"room": SESSION, "text": "x"})
     assert (status, signed) == (502, True)
+
+
+# --- images -------------------------------------------------------------------------------------------------------
+
+PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 4
+
+
+def image(plugin, data=PNG, mime="image/png", room=SESSION, sender=OWNER, caption=None, size=None, plain_url=False,
+          msgtype="m.image", info=True):
+    """An m.image whose attachment is encrypted as a client does it and held by the fake media repository."""
+    cipher, enc = encrypt_attachment(data)
+    url = f"mxc://example.org/{next(_counter)}"
+    plugin.client.files[url] = cipher
+    extra = {"filename": "photo.png", "info": {"mimetype": mime, "size": len(data) if size is None else size}}
+    if not info:
+        del extra["info"]
+    if plain_url:
+        extra["url"] = url
+    else:
+        extra["file"] = dict(enc.serialize(), url=url)
+    return message(plugin, caption if caption is not None else "photo.png", room=room, sender=sender, msgtype=msgtype,
+                   extra=extra)
+
+
+async def events(client):
+    return (await call(client, "/events", {"wait": 0}))[1]["events"]
+
+
+async def test_encrypted_image_round_trip_and_served_once(setup):
+    plugin, client = setup
+    await plugin.on_message(image(plugin))
+    [item] = await events(client)
+    assert item["room"] == SESSION and item["text"] == "" and item["image"]["mime"] == "image/png"
+    assert item["image"]["size"] == len(PNG)
+    status, body, signed = await call(client, "/media", {"id": item["image"]["id"]})
+    assert (status, signed, body["mime"]) == (200, True, "image/png")
+    assert base64.b64decode(body["data"]) == PNG
+    status, body, signed = await call(client, "/media", {"id": item["image"]["id"]})
+    assert (status, signed) == (404, True) and len(plugin.media) == 0
+
+
+async def test_caption_follows_the_filename_convention(setup):
+    plugin, client = setup
+    await plugin.on_message(image(plugin, caption="what is this?"))
+    await plugin.on_message(image(plugin))
+    assert [e["text"] for e in await events(client)] == ["what is this?", ""]
+
+
+async def test_image_refusals_give_notices(setup):
+    plugin, client = setup
+    big = core.IMAGE_MAX + 1
+    await plugin.on_message(image(plugin, size=big))                       # announced too large
+    await plugin.on_message(image(plugin, data=b"x" * big))                # announced small, really large
+    await plugin.on_message(image(plugin, mime="image/svg+xml"))
+    await plugin.on_message(image(plugin, plain_url=True))                 # not an encrypted attachment
+    await plugin.on_message(image(plugin, info=False))
+    await plugin.on_message(image(plugin, room=CONTROL))
+    assert await events(client) == [] and len(plugin.media) == 0
+    texts = [c[2]["body"] for c in plugin.client.sent]
+    assert len(texts) == 6 and all(c[2]["msgtype"] == "m.notice" for c in plugin.client.sent)
+    assert "Images go into a session room." in texts[-1] and "Only text and images" in texts[2]
+    assert "not sent as an encrypted attachment" in texts[3]
+
+
+async def test_image_of_a_corrupt_attachment_is_refused(setup):
+    plugin, client = setup
+    evt = image(plugin)
+    url = next(iter(plugin.client.files))
+    plugin.client.files[url] = plugin.client.files[url][:-1] + b"\x00"    # hash mismatch
+    await plugin.on_message(evt)
+    assert await events(client) == [] and "decrypted" in plugin.client.sent[-1][2]["body"]
+
+
+async def test_image_from_others_or_unencrypted_is_ignored(setup):
+    plugin, client = setup
+    await plugin.on_message(image(plugin, sender="@other:example.org"))
+    await plugin.on_message(image(plugin, room=FOREIGN))
+    assert await events(client) == [] and plugin.client.sent == []
+
+
+async def test_unsupported_message_types_get_a_notice(setup):
+    plugin, client = setup
+    for msgtype in ("m.file", "m.audio", "m.video"):
+        await plugin.on_message(message(plugin, "x", msgtype=msgtype))
+    await plugin.on_message(message(plugin, "x", msgtype="m.notice"))
+    await plugin.on_message(message(plugin, "x", extra={"m.relates_to": {"rel_type": "m.replace", "event_id": "$o"}}))
+    assert len(plugin.client.sent) == 3 and "Only text and images" in plugin.client.sent[0][2]["body"]
+
+
+async def test_media_needs_a_signature_and_a_valid_id(setup):
+    plugin, client = setup
+    await plugin.on_message(image(plugin))
+    key = (await events(client))[0]["image"]["id"]
+    status, body, signed = await call(client, "/media", {"id": key}, secret="x" * 40)
+    assert (status, signed) == (401, False) and len(plugin.media) == 1
+    assert (await call(client, "/media", {"id": "../x"}))[0] == 400
+    assert (await call(client, "/media", {}))[0] == 400
+    assert len(plugin.media) == 1

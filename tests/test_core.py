@@ -119,3 +119,31 @@ def test_edit_content():
     content = core.edit_content("$e", "new")
     assert content["m.new_content"]["body"] == "new" and content["m.relates_to"]["event_id"] == "$e"
     assert core.is_edit(content) and not core.is_edit({"body": "x"})
+
+
+def test_media_store_serves_once_and_drops_the_oldest():
+    store = core.MediaStore()
+    keys = [store.put("image/png", b"x") for _ in range(core.MEDIA_COUNT + 1)]
+    assert len(store) == core.MEDIA_COUNT and store.take(keys[0]) is None
+    assert store.take(keys[1]) == ("image/png", b"x") and store.take(keys[1]) is None
+
+
+def test_media_store_byte_limit():
+    store = core.MediaStore()
+    first = store.put("image/png", b"x" * (30 * 1024 * 1024))
+    second = store.put("image/png", b"y" * (30 * 1024 * 1024))
+    assert store.take(first) is None and store.take(second) is not None
+
+
+def test_caption_convention():
+    assert core.caption_of({"body": "a cat", "filename": "cat.png"}) == "a cat"
+    assert core.caption_of({"body": "cat.png", "filename": "cat.png"}) == ""
+    assert core.caption_of({"body": "cat.png"}) == ""
+
+
+def test_inbox_item_carries_the_image():
+    inbox = core.Inbox()
+    inbox.add("!r", "", "$e", {"id": "i", "mime": "image/png", "size": 3})
+    inbox.add("!r", "t", "$f")
+    first, second = inbox.since(None, 0)
+    assert first["image"]["id"] == "i" and "image" not in second

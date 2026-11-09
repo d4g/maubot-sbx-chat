@@ -20,7 +20,7 @@ import hmac
 import re
 import secrets
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 
 MAX_SKEW = 60
@@ -35,6 +35,12 @@ NAME_MAX = 80
 # What the owner may send in one message; longer is cut off at the room, not queued.
 INBOUND_MAX = 16 * 1024
 QUEUE_MAX = 500
+# Images from the owner: what is accepted, and how many wait in memory for the caller to fetch them.
+IMAGE_MAX = 10 * 1024 * 1024
+IMAGE_MIMES = ("image/png", "image/jpeg", "image/webp", "image/gif")
+MEDIA_COUNT = 5
+MEDIA_BYTES = 50 * 1024 * 1024
+MEDIA_ID = re.compile(r"[A-Za-z0-9_-]{16,64}")
 WAIT_MAX = 30
 
 
@@ -166,6 +172,13 @@ def parse_archive(data) -> tuple[str, str]:
     return _room(data), _name(data)
 
 
+def parse_media(data) -> str:
+    key = _object(data).get("id")
+    if not isinstance(key, str) or not MEDIA_ID.fullmatch(key):
+        raise Refused(400, "bad id")
+    return key
+
+
 def parse_events(data) -> tuple[str | None, int, float]:
     """(epoch the caller knows or None, last sequence number it has processed, seconds to wait)."""
     data = _object(data)
@@ -193,9 +206,13 @@ class Inbox:
     seq: int = 0
     items: deque = field(default_factory=lambda: deque(maxlen=QUEUE_MAX))
 
-    def add(self, room: str, text: str, event: str) -> int:
+    def add(self, room: str, text: str, event: str, image: dict | None = None) -> int:
+        """image: {"id", "mime", "size"} of an attachment held in a MediaStore; the text is then its caption."""
         self.seq += 1
-        self.items.append({"seq": self.seq, "room": room, "text": text, "event": event})
+        item = {"seq": self.seq, "room": room, "text": text, "event": event}
+        if image:
+            item["image"] = image
+        self.items.append(item)
         return self.seq
 
     def since(self, epoch: str | None, after: int) -> list[dict]:
@@ -205,6 +222,42 @@ class Inbox:
 
     def reply(self, epoch: str | None, after: int) -> dict:
         return {"epoch": self.epoch, "events": self.since(epoch, after)}
+
+
+class MediaStore:
+    """Decrypted images in memory until the caller fetches them: at most MEDIA_COUNT and MEDIA_BYTES, the oldest dropped
+    first. An image is served once and then gone. A restart of maubot loses them; the caller says so in the room."""
+
+    def __init__(self) -> None:
+        self._items: OrderedDict[str, tuple[str, bytes]] = OrderedDict()
+        self._bytes = 0
+
+    def put(self, mime: str, data: bytes) -> str:
+        key = secrets.token_urlsafe(16)
+        self._items[key] = (mime, data)
+        self._bytes += len(data)
+        while len(self._items) > MEDIA_COUNT or (self._bytes > MEDIA_BYTES and len(self._items) > 1):
+            _, (_, old) = self._items.popitem(last=False)
+            self._bytes -= len(old)
+        return key
+
+    def take(self, key: str) -> tuple[str, bytes] | None:
+        found = self._items.pop(key, None)
+        if found:
+            self._bytes -= len(found[1])
+        return found
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
+def caption_of(content: dict) -> str:
+    """Matrix caption convention: with a filename that differs from body, body is the caption; otherwise `body` is only
+    the file name and there is no caption."""
+    body, name = content.get("body"), content.get("filename")
+    if isinstance(body, str) and isinstance(name, str) and name and name != body:
+        return body.strip()
+    return ""
 
 
 def edit_content(event: str, text: str) -> dict:
