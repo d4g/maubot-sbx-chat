@@ -1,0 +1,8 @@
+# The only Matrix user whose messages count (full MXID, "@name:server").
+owner: ""
+# The control room (internal room ID, "!...:server"): where the owner gives commands such as !new. Session rooms are
+# made by this plugin through POST /room and need no entry here.
+room_id: ""
+# Shared secret with the caller (sbx-chat on VM 130), at least 32 characters. Never sent over the wire: requests and
+# responses are signed with HMAC-SHA256 over it. While it is empty or shorter, every request is refused.
+secret: ""

@@ -1,0 +1,11 @@
+maubot: 0.1.0
+id: rocks.dag.sbx-chat
+version: 0.1.0
+license: Unlicense
+modules:
+- sbx_chat
+main_class: SbxChat
+config: true
+webapp: true
+extra_files:
+- base-config.yaml
