@@ -22,6 +22,10 @@ mautrix 0.21.1 with a fake Matrix client, routed as maubot routes them). Not yet
 - **Encrypted only.** As in sbx-approval, a message counts only if the server's copy of it is `m.room.encrypted`
   (maubot hands plugins an event without the decryption marker, so the plugin fetches the stored event and decrypts it
   again). Session rooms are created with `m.room.encryption` as initial state.
+- **A new key when the owner joins.** The room is created with the owner only invited, and mautrix shares the first Megolm
+  session with the joined members, which is the bot alone, and keeps it when the invitation becomes a join. So the plugin
+  drops the room's outbound session when the owner joins (`on_member`), and the next message gets a session that includes
+  the owner. What the bot sent before the join stays unreadable for the owner.
 - **The caller always initiates.** The program on VM 130 polls `POST /events` and posts to the other endpoints; no port
   opens there and no Matrix key is stored there.
 - **Signed with HMAC**, requests and responses, over a shared secret with timestamp and nonce (the scheme of

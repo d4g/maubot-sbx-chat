@@ -8,6 +8,7 @@ import json
 import logging
 import pathlib
 import sys
+import types
 import urllib.parse
 
 import pytest
@@ -16,7 +17,7 @@ pytest.importorskip("maubot")
 from aiohttp import web  # noqa: E402
 from maubot.matrix import MaubotMessageEvent  # noqa: E402
 from maubot.plugin_server import PluginWebApp, PrefixResource  # noqa: E402
-from mautrix.types import Event  # noqa: E402
+from mautrix.types import Event, Membership  # noqa: E402
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import sbx_chat  # noqa: E402
@@ -39,9 +40,18 @@ class FakeApi:
         return self.stored[urllib.parse.unquote(str(path).rsplit("/", 1)[-1])]
 
 
+class FakeCryptoStore:
+    def __init__(self):
+        self.dropped = []
+
+    async def remove_outbound_group_session(self, room_id):
+        self.dropped.append(room_id)
+
+
 class FakeCrypto:
     def __init__(self):
         self.plain = {}
+        self.crypto_store = FakeCryptoStore()
 
     async def decrypt_megolm_event(self, evt):
         return Event.deserialize(self.plain[evt.event_id])
@@ -160,6 +170,29 @@ async def test_owner_message_is_queued(setup):
     assert [(e["room"], e["text"]) for e in body["events"]] == [(SESSION, "hello"), (CONTROL, "in control")]
     again = await call(client, "/events", {"epoch": body["epoch"], "after": 1})
     assert [e["text"] for e in again[1]["events"]] == ["in control"]
+
+
+def member(room, who, membership, sender=None):
+    return types.SimpleNamespace(room_id=room, state_key=who, sender=sender or who,
+                                 content=types.SimpleNamespace(membership=membership))
+
+
+async def test_owner_join_drops_the_group_session(setup):
+    """The session made while the owner was only invited was shared with nobody else; a join must replace it."""
+    plugin, _ = setup
+    await plugin.on_member(member(SESSION, OWNER, Membership.JOIN))
+    assert plugin.client.crypto.crypto_store.dropped == [SESSION]
+
+
+async def test_other_membership_changes_keep_the_group_session(setup):
+    plugin, _ = setup
+    other = "@other:example.org"
+    await plugin.on_member(member(SESSION, other, Membership.JOIN))                # someone else
+    await plugin.on_member(member(SESSION, OWNER, Membership.INVITE, sender=BOT))  # the invitation itself
+    await plugin.on_member(member(SESSION, OWNER, Membership.LEAVE))
+    await plugin.on_member(member(SESSION, OWNER, Membership.JOIN, sender=other))  # not the owner's own join
+    await plugin.on_member(member(FOREIGN, OWNER, Membership.JOIN))                # a room the bot did not create
+    assert plugin.client.crypto.crypto_store.dropped == []
 
 
 async def test_everything_else_is_ignored(setup):

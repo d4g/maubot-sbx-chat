@@ -10,7 +10,7 @@ from aiohttp.web import Request, Response
 from maubot import Plugin
 from maubot.handlers import event, web
 from mautrix.api import Method, Path
-from mautrix.types import EncryptedEvent, Event, EventType, MessageType, TextMessageEventContent
+from mautrix.types import EncryptedEvent, Event, EventType, Membership, MessageType, TextMessageEventContent
 from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
 
 from . import core
@@ -216,6 +216,27 @@ class SbxChat(Plugin):
         async with self.fresh:
             self.inbox.add(evt.room_id, body, evt.event_id)
             self.fresh.notify_all()
+
+    @event.on(EventType.ROOM_MEMBER)
+    async def on_member(self, evt) -> None:
+        """The owner joined a room of this plugin: start a new Megolm session, so that the owner can read what follows.
+
+        Why: the bot creates a room and sends into it while the owner is only invited. mautrix then shares the first
+        session with the joined members, which is the bot alone, and it keeps that session when an invitation turns
+        into a join (mautrix/crypto/machine.py, `ignored_changes`), so every later message would stay unreadable for
+        the owner ("Unable to decrypt message"; seen 2026-11-09). Dropping the outbound session makes the next
+        message create one that is shared with everybody who has joined by then. What was sent before the join stays
+        unreadable: the owner's device never got that key."""
+        if evt.state_key != self.config["owner"] or evt.content.membership != Membership.JOIN:
+            return
+        if evt.sender != evt.state_key or not await self._is_ours(evt.room_id):
+            return
+        if not self.client.crypto:
+            return
+        try:
+            await self.client.crypto.crypto_store.remove_outbound_group_session(evt.room_id)
+        except Exception:
+            self.log.exception("could not drop the group session of %s", evt.room_id)
 
     async def _note(self, room: str, text: str) -> None:
         try:
