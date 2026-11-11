@@ -204,6 +204,37 @@ class SbxChat(Plugin):
             self.log.exception("archive failed")
             return self._reply(await self._nonce_of(request), 502, {"error": "could not archive"})
 
+    @web.post("/nick")
+    async def nick(self, request: Request) -> Response:
+        """The bot's own display name in one session room, so that its answers carry the name of the character it plays.
+        It is the bot's own member event (a user can set only their own), sent again with the name changed: membership
+        and the room's avatar are kept, everything else of the old event is dropped. The control room keeps the bot's name."""
+        try:
+            nonce, data = await self._read(request)
+            room, name = core.parse_nick(data)
+            if room == self.config["room_id"]:
+                raise core.Refused(403, "the control room keeps the bot's own name")
+            await self._need_room(room)
+            content = {"membership": "join", "displayname": name}
+            avatar = (await self._own_member(room)).get("avatar_url")
+            if isinstance(avatar, str):
+                content["avatar_url"] = avatar
+            await self.client.send_state_event(room, EventType.ROOM_MEMBER, content, state_key=self.client.mxid)
+            return self._reply(nonce, 200, {"nick": name})
+        except core.Refused as error:
+            return self._refused(error)
+        except Exception:
+            self.log.exception("nick failed")
+            return self._reply(await self._nonce_of(request), 502, {"error": "could not set the name"})
+
+    async def _own_member(self, room: str) -> dict:
+        """The bot's current member event content in a room, {} if it cannot be read."""
+        try:
+            content = await self.client.api.request(Method.GET, Path.v3.rooms[room].state["m.room.member"][self.client.mxid])
+            return content if isinstance(content, dict) else {}
+        except Exception:
+            return {}
+
     @staticmethod
     async def _nonce_of(request: Request) -> str:
         return request.headers.get("X-Sbx-Nonce", "")

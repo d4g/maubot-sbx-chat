@@ -55,6 +55,7 @@ signed, stale or replayed request gets `401` without a signature, and `503` whil
 | `POST /send` | `{"room", "text"}` — text ≤ 30 KiB UTF-8, plain (no markup is built from it) | `201 {"event"}`; `403` not a room of this plugin; `413`; `502` |
 | `POST /edit` | `{"room", "event", "text"}` — replaces an earlier message of this account (`m.replace`) | `200 {"event"}` |
 | `POST /room` | `{"name"}` ≤ 80 characters | `201 {"room"}` — private, encrypted from creation, the owner invited |
+| `POST /nick` | `{"room", "name"}` — one line, ≤ 80 characters | `200 {"nick"}` — the bot's own display name in that room (its own member event, avatar kept); `403` for the control room or a foreign room |
 | `POST /archive` | `{"room", "name"}` | `200 {"archived": true}` — renames the room, then leaves it; never the control room |
 
 **Events and restarts.** The caller confirms by sending the last sequence number it processed, so a lost answer only

@@ -167,6 +167,12 @@ def parse_room(data) -> str:
     return _name(_object(data))
 
 
+def parse_nick(data) -> tuple[str, str]:
+    """(room, the display name the bot takes in that room): one line, at most NAME_MAX characters."""
+    data = _object(data)
+    return _room(data), _name(data).strip()
+
+
 def parse_archive(data) -> tuple[str, str]:
     data = _object(data)
     return _room(data), _name(data)

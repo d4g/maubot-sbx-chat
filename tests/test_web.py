@@ -69,7 +69,7 @@ class FakeClient:
     disable_replies = False
 
     def __init__(self):
-        self.sent, self.created, self.left = [], [], []
+        self.sent, self.created, self.left, self.state_keys = [], [], [], []
         self.api, self.crypto = FakeApi(), FakeCrypto()
         self.files = {}
         # Who created which room, as the state of the room says.
@@ -86,8 +86,9 @@ class FakeClient:
         self.sent.append((room, str(event_type), content))
         return f"$ev{len(self.sent)}"
 
-    async def send_state_event(self, room, event_type, content):
+    async def send_state_event(self, room, event_type, content, state_key=""):
         self.sent.append((room, str(event_type), content))
+        self.state_keys.append(state_key)
         return "$state"
 
     async def create_room(self, **kwargs):
@@ -279,6 +280,31 @@ async def test_archive(setup):
     status, body, _ = await call(client, "/archive", {"room": CONTROL, "name": "x"})
     assert status == 403 and plugin.client.left == [SESSION]
     assert (await call(client, "/archive", {"room": FOREIGN, "name": "x"}))[0] == 403
+
+
+async def test_nick_sets_the_bots_own_member_event_and_keeps_the_avatar(setup):
+    plugin, client = setup
+    plugin.client.api.stored[BOT] = {"membership": "join", "displayname": "old", "avatar_url": "mxc://example.org/a", "reason": "x"}
+    assert await call(client, "/nick", {"room": SESSION, "name": " Mira "}) == (200, {"nick": "Mira"}, True)
+    assert plugin.client.sent[-1] == (SESSION, "m.room.member", {"membership": "join", "displayname": "Mira",
+                                                                  "avatar_url": "mxc://example.org/a"})
+    assert plugin.client.state_keys == [BOT]                      # the bot's own event, never somebody else's
+
+
+async def test_nick_without_a_readable_member_event_sends_no_avatar(setup):
+    plugin, client = setup
+    assert (await call(client, "/nick", {"room": SESSION, "name": "Mira"}))[0] == 200
+    assert plugin.client.sent[-1][2] == {"membership": "join", "displayname": "Mira"}
+
+
+async def test_nick_refusals(setup):
+    plugin, client = setup
+    assert (await call(client, "/nick", {"room": CONTROL, "name": "x"}))[0] == 403
+    assert (await call(client, "/nick", {"room": FOREIGN, "name": "x"}))[0] == 403
+    for bad in ({"room": SESSION}, {"room": SESSION, "name": "  "}, {"room": SESSION, "name": "a\nb"},
+                {"room": SESSION, "name": "x" * (core.NAME_MAX + 1)}, {"name": "x"}):
+        assert (await call(client, "/nick", bad))[0] == 400, bad
+    assert plugin.client.state_keys == []
 
 
 async def test_matrix_failure_is_signed_502(setup):
