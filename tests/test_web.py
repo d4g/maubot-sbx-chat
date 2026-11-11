@@ -372,6 +372,26 @@ async def test_picture_refusals(setup):
     assert plugin.client.uploads == [] and plugin.client.state_keys == []
 
 
+async def test_send_in_a_thread_and_the_plain_send_is_unchanged(setup):
+    plugin, client = setup
+    status, body, signed = await call(client, "/send", {"room": SESSION, "text": "thinking...", "thread": "$answer:example.org"})
+    assert (status, signed) == (201, True) and body["thread"] == "$answer:example.org"
+    assert plugin.client.sent[-1] == (SESSION, "m.room.message", {
+        "msgtype": "m.text", "body": "thinking...",
+        "m.relates_to": {"rel_type": "m.thread", "event_id": "$answer:example.org", "is_falling_back": True,
+                         "m.in_reply_to": {"event_id": "$answer:example.org"}}})
+    status, body, _ = await call(client, "/send", {"room": SESSION, "text": "plain"})
+    assert status == 201 and "thread" not in body and plugin.client.sent[-1][2]["body"] == "plain"
+    assert "m.relates_to" not in plugin.client.sent[-1][2]
+
+
+async def test_send_refuses_a_bad_thread_and_a_foreign_room(setup):
+    plugin, client = setup
+    for bad in ("answer", "$a b", 5, ""):
+        assert (await call(client, "/send", {"room": SESSION, "text": "x", "thread": bad}))[0] == 400, bad
+    assert (await call(client, "/send", {"room": FOREIGN, "text": "x", "thread": "$a:b"}))[0] == 403
+
+
 async def test_matrix_failure_is_signed_502(setup):
     plugin, client = setup
 

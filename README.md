@@ -52,7 +52,7 @@ signed, stale or replayed request gets `401` without a signature, and `503` whil
 |---|---|---|
 | `POST /events` | `{"epoch"?, "after"?, "wait"?}` — the epoch the caller last saw, the last sequence number it processed, seconds to wait for a message (0 to 30) | `200 {"epoch", "events": [{"seq", "room", "text", "event", "image"?}, …]}` — everything after `after`; `text` is the caption of an image, possibly empty; waits until there is something or `wait` ran out |
 | `POST /media` | `{"id"}` — the `image.id` of an event | `200 {"mime", "data"}` (base64), **once**: the image is removed when served; signed `404` if unknown (served already, dropped, or maubot restarted) |
-| `POST /send` | `{"room", "text"}` — text ≤ 30 KiB UTF-8, plain (no markup is built from it) | `201 {"event"}`; `403` not a room of this plugin; `413`; `502` |
+| `POST /send` | `{"room", "text", "thread"?}` — text ≤ 30 KiB UTF-8, plain (no markup is built from it); `thread`: the event ID of a message this account sent, then the text is a reply in that message's thread (`m.thread`), as maubot-sbx-approval does for its detail | `201 {"event", "thread"?}` (`thread` repeated, so a caller can tell that this version knew the field); `403` not a room of this plugin; `413`; `502` |
 | `POST /edit` | `{"room", "event", "text"}` — replaces an earlier message of this account (`m.replace`) | `200 {"event"}` |
 | `POST /room` | `{"name"}` ≤ 80 characters | `201 {"room"}` — private, encrypted from creation, the owner invited |
 | `POST /nick` | `{"room", "name"}` — one line, ≤ 80 characters | `200 {"nick"}` — the bot's own display name in that room (its own member event, avatar kept); `403` for the control room or a foreign room |

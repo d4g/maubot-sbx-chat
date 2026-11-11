@@ -161,6 +161,21 @@ def parse_send(data) -> tuple[str, str]:
     return _room(data), _text(data)
 
 
+def parse_thread(data) -> str | None:
+    """The event a /send message is to be a reply to in a thread (`thread`), or None for a plain message."""
+    thread = _object(data).get("thread")
+    if thread is None:
+        return None
+    if not isinstance(thread, str) or not EVENT.fullmatch(thread):
+        raise Refused(400, "bad thread")
+    return thread
+
+
+def thread_relation(root: str) -> dict:
+    """m.relates_to of a message in the thread of `root`; the same shape maubot-sbx-approval uses for its detail messages."""
+    return {"rel_type": "m.thread", "event_id": root, "is_falling_back": True, "m.in_reply_to": {"event_id": root}}
+
+
 def parse_edit(data) -> tuple[str, str, str]:
     data = _object(data)
     event = data.get("event")

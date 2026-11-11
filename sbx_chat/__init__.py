@@ -153,9 +153,18 @@ class SbxChat(Plugin):
         try:
             nonce, data = await self._read(request)
             room, text = core.parse_send(data)
+            thread = core.parse_thread(data)
             await self._need_room(room)
-            event_id = await self.client.send_message(room, _message(text))
-            return self._reply(nonce, 201, {"event": event_id})
+            if thread is None:
+                event_id = await self.client.send_message(room, _message(text))
+            else:
+                # A reply in the thread of `thread` (a message of this account, e.g. an answer): plain text, like _message.
+                event_id = await self.client.send_message_event(
+                    room, EventType.ROOM_MESSAGE,
+                    {"msgtype": "m.text", "body": text, "m.relates_to": core.thread_relation(thread)})
+            # `thread` in the answer tells the caller that this plugin knew the field: an older one would have sent the text
+            # into the room's main timeline and ignored it.
+            return self._reply(nonce, 201, {"event": event_id, **({"thread": thread} if thread else {})})
         except core.Refused as error:
             return self._refused(error)
         except Exception:
