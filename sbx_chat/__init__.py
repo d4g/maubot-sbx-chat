@@ -21,6 +21,9 @@ from . import core
 # The largest request: a text of core.TEXT_MAX plus the JSON around it.
 BODY_MAX = core.TEXT_MAX + 4 * 1024
 UNSUPPORTED = "Only text and images (PNG, JPEG, WebP, GIF, up to 10 MiB) are supported."
+# How long what the daemon sends into a new room is held back for the owner's join. After that the owner is assumed not
+# to come, the held messages are dropped and the room behaves like any other (a send goes out at once).
+HOLD_MAX = 24 * 3600
 ENCRYPTION = {"type": "m.room.encryption", "state_key": "", "content": {"algorithm": "m.megolm.v1.aes-sha2"}}
 
 
@@ -37,6 +40,10 @@ class SbxChat(Plugin):
     fresh: asyncio.Condition
     # Rooms this account made (or found to have made, after a restart): True or False per room ID.
     own_rooms: dict[str, bool]
+    # Rooms made here whose owner has not joined yet: room ID -> [monotonic time of creation, [held texts]]. What is sent
+    # before the join cannot be read by the owner (see on_member), so /send holds it here and on_member sends it after.
+    # Not persistent: after a plugin restart a send goes out at once.
+    awaiting: dict[str, list]
 
     @classmethod
     def get_config_class(cls) -> type[BaseProxyConfig]:
@@ -49,6 +56,7 @@ class SbxChat(Plugin):
         self.media = core.MediaStore()
         self.fresh = asyncio.Condition()
         self.own_rooms = {}
+        self.awaiting = {}
         if self._secret() is None:
             self.log.warning("secret missing or shorter than %d characters: every request is refused", core.SECRET_MIN)
 
@@ -155,6 +163,10 @@ class SbxChat(Plugin):
             room, text = core.parse_send(data)
             thread = core.parse_thread(data)
             await self._need_room(room)
+            if thread is None and self._hold(room, text):
+                # 202: accepted, sent after the owner's join; there is no event ID yet. A reply in a thread is never held:
+                # it answers a message of this account, which the owner can only have read after the join.
+                return self._reply(nonce, 202, {"event": None, "held": True})
             if thread is None:
                 event_id = await self.client.send_message(room, _message(text))
             else:
@@ -196,6 +208,7 @@ class SbxChat(Plugin):
             room_id = await self.client.create_room(name=name, invitees=[self.config["owner"]], is_direct=False,
                                                     initial_state=[ENCRYPTION])
             self.own_rooms[room_id] = True
+            self.awaiting[room_id] = [time.monotonic(), []]
             return self._reply(nonce, 201, {"room": room_id})
         except core.Refused as error:
             return self._refused(error)
@@ -215,6 +228,7 @@ class SbxChat(Plugin):
             await self.client.send_state_event(room, EventType.ROOM_NAME, {"name": name})
             await self.client.leave_room(room)
             self.own_rooms.pop(room, None)
+            self.awaiting.pop(room, None)
             return self._reply(nonce, 200, {"archived": True})
         except core.Refused as error:
             return self._refused(error)
@@ -304,6 +318,19 @@ class SbxChat(Plugin):
         except Exception:
             return {}
 
+    def _hold(self, room: str, text: str) -> bool:
+        """True if the text was kept for the owner's join. False if the room is not waiting for the owner, or has waited
+        longer than HOLD_MAX: then whatever was held is dropped and the text is sent at once."""
+        waiting = self.awaiting.get(room)
+        if waiting is None:
+            return False
+        if time.monotonic() - waiting[0] > HOLD_MAX:
+            self.awaiting.pop(room, None)
+            self.log.warning("the owner never joined %s: dropped %d held message(s)", room, len(waiting[1]))
+            return False
+        waiting[1].append(text)
+        return True
+
     @staticmethod
     async def _nonce_of(request: Request) -> str:
         return request.headers.get("X-Sbx-Nonce", "")
@@ -392,12 +419,18 @@ class SbxChat(Plugin):
             return
         if evt.sender != evt.state_key or not await self._is_ours(evt.room_id):
             return
-        if not self.client.crypto:
-            return
-        try:
-            await self.client.crypto.crypto_store.remove_outbound_group_session(evt.room_id)
-        except Exception:
-            self.log.exception("could not drop the group session of %s", evt.room_id)
+        if self.client.crypto:
+            try:
+                await self.client.crypto.crypto_store.remove_outbound_group_session(evt.room_id)
+            except Exception:
+                self.log.exception("could not drop the group session of %s", evt.room_id)
+        # Only now, with the new session, can the owner read the notices the daemon sent before the join.
+        waiting = self.awaiting.pop(evt.room_id, None)
+        for text in waiting[1] if waiting else []:
+            try:
+                await self.client.send_message(evt.room_id, _message(text))
+            except Exception:
+                self.log.exception("could not send a held message to %s", evt.room_id)
 
     async def _note(self, room: str, text: str) -> None:
         try:

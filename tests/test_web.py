@@ -123,6 +123,7 @@ def make_plugin():
     plugin.media = core.MediaStore()
     plugin.fresh = asyncio.Condition()
     plugin.own_rooms = {}
+    plugin.awaiting = {}
     return plugin
 
 
@@ -280,8 +281,8 @@ async def test_room_is_encrypted_and_owner_invited(setup):
     made = plugin.client.created[0]
     assert made["invitees"] == [OWNER] and made["name"] == "local/x"
     assert made["initial_state"][0]["type"] == "m.room.encryption"
-    # The new room is one of ours without asking the server.
-    assert (await call(client, "/send", {"room": "!new:example.org", "text": "x"}))[0] == 201
+    # The new room is one of ours without asking the server (a send is accepted, held until the owner joins).
+    assert (await call(client, "/send", {"room": "!new:example.org", "text": "x"}))[0] == 202
 
 
 async def test_archive(setup):
@@ -507,3 +508,54 @@ async def test_a_large_valid_picture_arrives_whole(setup):
     big = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * (6 * 1024)
     assert (await call(client, "/avatar", {"room": SESSION, "data": base64.b64encode(big).decode()}))[0] == 200
     assert plugin.client.uploads[-1][0] == big
+
+
+async def test_send_into_a_new_room_is_held_until_the_owner_joins(setup):
+    """The first notice of the daemon went out before the owner had joined and was unreadable for him."""
+    plugin, client = setup
+    room = "!new:example.org"
+    plugin.client.creators[room] = BOT
+    assert (await call(client, "/room", {"name": "local/x"}))[0] == 201
+    status, body, signed = await call(client, "/send", {"room": room, "text": "Session local/x"})
+    assert (status, body, signed) == (202, {"event": None, "held": True}, True)
+    await call(client, "/send", {"room": room, "text": "second"})
+    assert plugin.client.sent == []                                   # nothing sent while the owner is only invited
+    await plugin.on_member(member(room, OWNER, Membership.INVITE, sender=BOT))
+    assert plugin.client.sent == []
+    await plugin.on_member(member(room, OWNER, Membership.JOIN))
+    assert plugin.client.crypto.crypto_store.dropped == [room]        # the new session first ...
+    assert [c[2]["body"] for c in plugin.client.sent] == ["Session local/x", "second"]   # ... then the held texts, in order
+    assert (await call(client, "/send", {"room": room, "text": "later"}))[0] == 201     # afterwards sends go out at once
+    await plugin.on_member(member(room, OWNER, Membership.JOIN))      # a second join event sends nothing again
+    assert len(plugin.client.sent) == 3
+
+
+async def test_held_messages_expire_when_the_owner_never_joins(setup):
+    plugin, client = setup
+    room = "!new:example.org"
+    await call(client, "/room", {"name": "local/x"})
+    await call(client, "/send", {"room": room, "text": "held"})
+    plugin.awaiting[room][0] -= sbx_chat.HOLD_MAX + 1
+    assert (await call(client, "/send", {"room": room, "text": "now"}))[0] == 201
+    assert [c[2]["body"] for c in plugin.client.sent] == ["now"] and room not in plugin.awaiting
+
+
+async def test_archive_forgets_held_messages(setup):
+    plugin, client = setup
+    room = "!new:example.org"
+    plugin.client.creators[room] = BOT
+    await call(client, "/room", {"name": "local/x"})
+    await call(client, "/send", {"room": room, "text": "held"})
+    await call(client, "/archive", {"room": room, "name": "[ended] x"})
+    assert room not in plugin.awaiting
+
+
+async def test_a_thread_reply_is_not_held_for_the_owner(setup):
+    """A reply in a thread answers a message of this account, so it is sent at once even while the owner has not joined."""
+    plugin, client = setup
+    room = "!new:example.org"
+    plugin.client.creators[room] = BOT
+    await call(client, "/room", {"name": "local/x"})
+    status, body, signed = await call(client, "/send", {"room": room, "text": "t", "thread": "$answer:example.org"})
+    assert (status, signed) == (201, True) and body["thread"] == "$answer:example.org"
+    assert plugin.client.sent[-1][2]["body"] == "t" and plugin.awaiting[room][1] == []
