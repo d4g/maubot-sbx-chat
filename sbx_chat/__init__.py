@@ -12,7 +12,8 @@ from maubot import Plugin
 from maubot.handlers import event, web
 from mautrix.api import Method, Path
 from mautrix.crypto.attachments import decrypt_attachment
-from mautrix.types import EncryptedEvent, Event, EventType, Membership, MessageType, TextMessageEventContent
+from mautrix.types import (EncryptedEvent, Event, EventType, MemberStateEventContent, Membership, MessageType,
+                           RoomAvatarStateEventContent, TextMessageEventContent)
 from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
 
 from . import core
@@ -233,13 +234,16 @@ class SbxChat(Plugin):
 
     async def _set_member(self, room: str, **changes: str) -> None:
         """The bot's own member event, sent again with `displayname` and/or `avatar_url` changed (an empty string removes it).
-        Whatever else the old event had is dropped; the membership stays join."""
+        Whatever else the old event had is dropped; the membership stays join. The content must be a MemberStateEventContent,
+        not a dict: after the PUT, maubot's client writes the event into its state store and reads `.membership` from it (a
+        dict broke that with an AttributeError after the server had already applied the change; seen 2026-11-11)."""
         old = await self._own_member(room)
-        content = {"membership": "join"}
+        fields = {}
         for key in ("displayname", "avatar_url"):
             value = changes.get(key, old.get(key))
             if isinstance(value, str) and value:
-                content[key] = value
+                fields[key] = value
+        content = MemberStateEventContent(membership=Membership.JOIN, **fields)
         await self.client.send_state_event(room, EventType.ROOM_MEMBER, content, state_key=self.client.mxid)
 
     @web.post("/avatar")
@@ -275,7 +279,7 @@ class SbxChat(Plugin):
                 raise core.Refused(403, "the control room keeps its icon")
             await self._need_room(room)
             url = await self.client.upload_media(image, mime_type="image/png", filename="icon.png")
-            await self.client.send_state_event(room, EventType.ROOM_AVATAR, {"url": str(url)})
+            await self.client.send_state_event(room, EventType.ROOM_AVATAR, RoomAvatarStateEventContent(url=url))
             return self._reply(nonce, 200, {"icon": True})
         except core.Refused as error:
             return self._refused(error)

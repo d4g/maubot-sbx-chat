@@ -19,7 +19,7 @@ from aiohttp import web  # noqa: E402
 from maubot.matrix import MaubotMessageEvent  # noqa: E402
 from maubot.plugin_server import PluginWebApp, PrefixResource  # noqa: E402
 from mautrix.crypto.attachments import encrypt_attachment  # noqa: E402
-from mautrix.types import Event, Membership  # noqa: E402
+from mautrix.types import Event, EventType, MemberStateEventContent, Membership  # noqa: E402
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import sbx_chat  # noqa: E402
@@ -87,6 +87,13 @@ class FakeClient:
         return f"$ev{len(self.sent)}"
 
     async def send_state_event(self, room, event_type, content, state_key=""):
+        # As maubot's client does after the PUT: a member event's content is read as an object (`.membership`), so a dict
+        # fails here, after the server has applied the change (the real failure of 2026-11-11).
+        if event_type == EventType.ROOM_MEMBER and not isinstance(content, MemberStateEventContent):
+            raise AttributeError("'dict' object has no attribute 'membership'")
+        if hasattr(content, "serialize"):
+            content = content.serialize()
+            content.pop("is_direct", None)             # the default of MemberStateEventContent, not what the tests are about
         self.sent.append((room, str(event_type), content))
         self.state_keys.append(state_key)
         return "$state"
