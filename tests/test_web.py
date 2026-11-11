@@ -69,7 +69,7 @@ class FakeClient:
     disable_replies = False
 
     def __init__(self):
-        self.sent, self.created, self.left, self.state_keys = [], [], [], []
+        self.sent, self.created, self.left, self.state_keys, self.uploads = [], [], [], [], []
         self.api, self.crypto = FakeApi(), FakeCrypto()
         self.files = {}
         # Who created which room, as the state of the room says.
@@ -94,6 +94,10 @@ class FakeClient:
     async def create_room(self, **kwargs):
         self.created.append(kwargs)
         return "!new:example.org"
+
+    async def upload_media(self, data, mime_type=None, filename=None):
+        self.uploads.append((bytes(data), mime_type, filename))
+        return f"mxc://example.org/up{len(self.uploads)}"
 
     async def download_media(self, url):
         return self.files[url]
@@ -307,6 +311,60 @@ async def test_nick_refusals(setup):
     assert plugin.client.state_keys == []
 
 
+AVATAR_PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 100
+
+
+def b64png(data=AVATAR_PNG):
+    return base64.b64encode(data).decode()
+
+
+async def test_avatar_uploads_the_png_and_sets_it_on_the_bots_member_event_keeping_the_name(setup):
+    plugin, client = setup
+    plugin.client.api.stored[BOT] = {"membership": "join", "displayname": "Mira", "avatar_url": "mxc://example.org/old"}
+    assert await call(client, "/avatar", {"room": SESSION, "data": b64png()}) == (200, {"avatar": True}, True)
+    assert plugin.client.uploads == [(AVATAR_PNG, "image/png", "avatar.png")]
+    assert plugin.client.sent[-1] == (SESSION, "m.room.member", {"membership": "join", "displayname": "Mira",
+                                                                  "avatar_url": "mxc://example.org/up1"})
+    assert plugin.client.state_keys == [BOT]
+
+
+async def test_avatar_with_empty_data_removes_the_picture_and_keeps_the_name(setup):
+    plugin, client = setup
+    plugin.client.api.stored[BOT] = {"membership": "join", "displayname": "Mira", "avatar_url": "mxc://example.org/old"}
+    assert await call(client, "/avatar", {"room": SESSION, "data": ""}) == (200, {"avatar": False}, True)
+    assert plugin.client.uploads == []
+    assert plugin.client.sent[-1][2] == {"membership": "join", "displayname": "Mira"}
+
+
+async def test_nick_keeps_the_picture_after_this_change(setup):
+    plugin, client = setup
+    plugin.client.api.stored[BOT] = {"membership": "join", "displayname": "old", "avatar_url": "mxc://example.org/a"}
+    assert (await call(client, "/nick", {"room": SESSION, "name": "Ann"}))[0] == 200
+    assert plugin.client.sent[-1][2] == {"membership": "join", "displayname": "Ann", "avatar_url": "mxc://example.org/a"}
+
+
+async def test_roomicon_uploads_and_sets_m_room_avatar(setup):
+    plugin, client = setup
+    assert await call(client, "/roomicon", {"room": SESSION, "data": b64png()}) == (200, {"icon": True}, True)
+    assert plugin.client.uploads == [(AVATAR_PNG, "image/png", "icon.png")]
+    assert plugin.client.sent[-1] == (SESSION, "m.room.avatar", {"url": "mxc://example.org/up1"})
+    assert plugin.client.state_keys == [""]
+
+
+async def test_picture_refusals(setup):
+    plugin, client = setup
+    big = b64png(b"\x89PNG\r\n\x1a\n" + b"x" * core.AVATAR_MAX)
+    for path in ("/avatar", "/roomicon"):
+        assert (await call(client, path, {"room": CONTROL, "data": b64png()}))[0] == 403
+        assert (await call(client, path, {"room": FOREIGN, "data": b64png()}))[0] == 403
+        assert (await call(client, path, {"room": SESSION, "data": b64png(b"not a png at all")}))[0] == 400
+        assert (await call(client, path, {"room": SESSION, "data": "%%%"}))[0] == 400
+        assert (await call(client, path, {"room": SESSION}))[0] == 400
+        assert (await call(client, path, {"room": SESSION, "data": big}))[0] == 413
+    assert (await call(client, "/roomicon", {"room": SESSION, "data": ""}))[0] == 400      # no way to remove an icon here
+    assert plugin.client.uploads == [] and plugin.client.state_keys == []
+
+
 async def test_matrix_failure_is_signed_502(setup):
     plugin, client = setup
 
@@ -414,3 +472,11 @@ async def test_media_needs_a_signature_and_a_valid_id(setup):
     assert (await call(client, "/media", {"id": "../x"}))[0] == 400
     assert (await call(client, "/media", {}))[0] == 400
     assert len(plugin.media) == 1
+
+
+async def test_a_large_valid_picture_arrives_whole(setup):
+    """The body is read to its end: a 1.5 MiB picture is several network chunks, and a cut body would fail its signature."""
+    plugin, client = setup
+    big = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * (6 * 1024)
+    assert (await call(client, "/avatar", {"room": SESSION, "data": base64.b64encode(big).decode()}))[0] == 200
+    assert plugin.client.uploads[-1][0] == big

@@ -60,12 +60,20 @@ class SbxChat(Plugin):
 
     # --- HTTP -------------------------------------------------------------------------------------------------
 
-    async def _read(self, request: Request) -> tuple[str, object]:
-        if request.content_length is not None and request.content_length > BODY_MAX:
+    async def _read(self, request: Request, limit: int = BODY_MAX) -> tuple[str, object]:
+        if request.content_length is not None and request.content_length > limit:
             raise core.Refused(413, "body too large")
-        body = await request.content.read(BODY_MAX + 1)
-        if len(body) > BODY_MAX:
-            raise core.Refused(413, "body too large")
+        # StreamReader.read(n) returns what has arrived so far, not n bytes: a large body (a picture) must be read to its end.
+        chunks, total = [], 0
+        while True:
+            chunk = await request.content.read(64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise core.Refused(413, "body too large")
+            chunks.append(chunk)
+        body = b"".join(chunks)
         nonce = core.check_request(self._secret(), self.nonces, request.method, request.path, request.headers, body,
                                    time.time())
         try:
@@ -215,17 +223,65 @@ class SbxChat(Plugin):
             if room == self.config["room_id"]:
                 raise core.Refused(403, "the control room keeps the bot's own name")
             await self._need_room(room)
-            content = {"membership": "join", "displayname": name}
-            avatar = (await self._own_member(room)).get("avatar_url")
-            if isinstance(avatar, str):
-                content["avatar_url"] = avatar
-            await self.client.send_state_event(room, EventType.ROOM_MEMBER, content, state_key=self.client.mxid)
+            await self._set_member(room, displayname=name)
             return self._reply(nonce, 200, {"nick": name})
         except core.Refused as error:
             return self._refused(error)
         except Exception:
             self.log.exception("nick failed")
             return self._reply(await self._nonce_of(request), 502, {"error": "could not set the name"})
+
+    async def _set_member(self, room: str, **changes: str) -> None:
+        """The bot's own member event, sent again with `displayname` and/or `avatar_url` changed (an empty string removes it).
+        Whatever else the old event had is dropped; the membership stays join."""
+        old = await self._own_member(room)
+        content = {"membership": "join"}
+        for key in ("displayname", "avatar_url"):
+            value = changes.get(key, old.get(key))
+            if isinstance(value, str) and value:
+                content[key] = value
+        await self.client.send_state_event(room, EventType.ROOM_MEMBER, content, state_key=self.client.mxid)
+
+    @web.post("/avatar")
+    async def avatar(self, request: Request) -> Response:
+        """The bot's own picture in one session room: a PNG, uploaded to the homeserver's media repository and set as the
+        avatar of the bot's member event (the name stays); an empty `data` removes the picture. The picture is NOT end-to-end
+        encrypted: it lies in the media repository, where only the homeserver's admin can delete it."""
+        try:
+            nonce, data = await self._read(request, core.AVATAR_BODY_MAX)
+            room, image = core.parse_avatar(data, clear_ok=True)
+            if room == self.config["room_id"]:
+                raise core.Refused(403, "the control room keeps the bot's own picture")
+            await self._need_room(room)
+            url = ""
+            if image is not None:
+                url = await self.client.upload_media(image, mime_type="image/png", filename="avatar.png")
+            await self._set_member(room, avatar_url=str(url))
+            return self._reply(nonce, 200, {"avatar": image is not None})
+        except core.Refused as error:
+            return self._refused(error)
+        except Exception:
+            self.log.exception("avatar failed")
+            return self._reply(await self._nonce_of(request), 502, {"error": "could not set the picture"})
+
+    @web.post("/roomicon")
+    async def roomicon(self, request: Request) -> Response:
+        """The icon of one session room (m.room.avatar): a PNG uploaded like the bot's picture. The bot made the room, so it has
+        the power to set it (not checked against a real server). Not encrypted either."""
+        try:
+            nonce, data = await self._read(request, core.AVATAR_BODY_MAX)
+            room, image = core.parse_avatar(data, clear_ok=False)
+            if room == self.config["room_id"]:
+                raise core.Refused(403, "the control room keeps its icon")
+            await self._need_room(room)
+            url = await self.client.upload_media(image, mime_type="image/png", filename="icon.png")
+            await self.client.send_state_event(room, EventType.ROOM_AVATAR, {"url": str(url)})
+            return self._reply(nonce, 200, {"icon": True})
+        except core.Refused as error:
+            return self._refused(error)
+        except Exception:
+            self.log.exception("room icon failed")
+            return self._reply(await self._nonce_of(request), 502, {"error": "could not set the room icon"})
 
     async def _own_member(self, room: str) -> dict:
         """The bot's current member event content in a room, {} if it cannot be read."""

@@ -15,6 +15,8 @@ string, so every call that needs a parameter carries it in a JSON body.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import re
@@ -32,6 +34,10 @@ EVENT = re.compile(r"\$[^\s]{1,200}")
 # m.new_content), so 30 KB of text is the limit. The caller splits longer texts.
 TEXT_MAX = 30 * 1024
 NAME_MAX = 80
+# The largest picture (a PNG, as it is) for the bot's avatar or a room's icon; the request carries it as base64.
+AVATAR_MAX = 2 * 1024 * 1024
+AVATAR_BODY_MAX = AVATAR_MAX * 4 // 3 + 4 * 1024
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 # What the owner may send in one message; longer is cut off at the room, not queued.
 INBOUND_MAX = 16 * 1024
 QUEUE_MAX = 500
@@ -171,6 +177,29 @@ def parse_nick(data) -> tuple[str, str]:
     """(room, the display name the bot takes in that room): one line, at most NAME_MAX characters."""
     data = _object(data)
     return _room(data), _name(data).strip()
+
+
+def parse_avatar(data, clear_ok: bool) -> tuple[str, bytes | None]:
+    """(room, the PNG bytes). `data` is the PNG as base64; an empty string means "remove the picture" (None) where clear_ok."""
+    data = _object(data)
+    room, raw = _room(data), data.get("data")
+    if not isinstance(raw, str):
+        raise Refused(400, "bad data")
+    if raw == "":
+        if clear_ok:
+            return room, None
+        raise Refused(400, "no image")
+    if len(raw) > AVATAR_BODY_MAX:
+        raise Refused(413, "image too large")
+    try:
+        image = base64.b64decode(raw, validate=True)
+    except (binascii.Error, ValueError):
+        raise Refused(400, "image is not base64")
+    if len(image) > AVATAR_MAX:
+        raise Refused(413, "image too large")
+    if not image.startswith(PNG_MAGIC):
+        raise Refused(400, "image is not a PNG")
+    return room, image
 
 
 def parse_archive(data) -> tuple[str, str]:
