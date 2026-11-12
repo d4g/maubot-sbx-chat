@@ -10,7 +10,7 @@ It holds no session state and runs no model or agent. The program behind it is `
 ADR 0027 ("Matrix chat front end for the sessions of the local boxes"). It reuses the pattern of
 [maubot-sbx-approval](https://github.com/d4g/maubot-sbx-approval) (ADR 0024).
 
-**Status:** version 0.2.0 (images added), tested off-line (logic, and the HTTP endpoints of the real plugin class against maubot 0.6.0 /
+**Status:** version 0.6.0 (formatted messages, threads in events, redaction), tested off-line (logic, and the HTTP endpoints of the real plugin class against maubot 0.6.0 /
 mautrix 0.21.1 with a fake Matrix client, routed as maubot routes them). Not yet run against a real homeserver.
 
 ## Design in brief
@@ -50,10 +50,11 @@ signed, stale or replayed request gets `401` without a signature, and `503` whil
 
 | Request | Body | Answer (signed) |
 |---|---|---|
-| `POST /events` | `{"epoch"?, "after"?, "wait"?}` — the epoch the caller last saw, the last sequence number it processed, seconds to wait for a message (0 to 30) | `200 {"epoch", "events": [{"seq", "room", "text", "event", "image"?}, …]}` — everything after `after`; `text` is the caption of an image, possibly empty; waits until there is something or `wait` ran out |
+| `POST /events` | `{"epoch"?, "after"?, "wait"?}` — the epoch the caller last saw, the last sequence number it processed, seconds to wait for a message (0 to 30) | `200 {"epoch", "events": [{"seq", "room", "text", "event", "image"?, "thread"?}, …]}` — everything after `after`; `text` is the caption of an image, possibly empty; `thread` is the event ID of the thread root when the owner wrote the message inside a Matrix thread (see below), absent otherwise; waits until there is something or `wait` ran out |
 | `POST /media` | `{"id"}` — the `image.id` of an event | `200 {"mime", "data"}` (base64), **once**: the image is removed when served; signed `404` if unknown (served already, dropped, or maubot restarted) |
-| `POST /send` | `{"room", "text", "thread"?}` — text ≤ 30 KiB UTF-8, plain (no markup is built from it); `thread`: the event ID of a message this account sent, then the text is a reply in that message's thread (`m.thread`), as maubot-sbx-approval does for its detail | `201 {"event", "thread"?}` (`thread` repeated, so a caller can tell that this version knew the field); `403` not a room of this plugin; `413`; `502` |
-| `POST /edit` | `{"room", "event", "text"}` — replaces an earlier message of this account (`m.replace`) | `200 {"event"}` |
+| `POST /send` | `{"room", "text", "thread"?, "markdown"?}` — text ≤ 30 KiB UTF-8, plain unless `markdown` is `true` (then also sent as HTML, see "Formatted messages"; a non-boolean is `400`); `thread`: the event ID of a message this account sent, then the text is a reply in that message's thread (`m.thread`), as maubot-sbx-approval does for its detail | `201 {"event", "thread"?, "markdown"?}` (`thread` and `markdown: true` repeated when applied, so a caller can tell that this version knew the field); `202 {"event": null, "held": true, …}` while the owner has not joined a new room (the held text is formatted too when sent); `403` not a room of this plugin; `413`; `502` |
+| `POST /edit` | `{"room", "event", "text", "markdown"?}` — replaces an earlier message of this account (`m.replace`); `markdown` as in `/send` | `200 {"event", "markdown"?}` (`markdown: true` repeated when applied) |
+| `POST /redact` | `{"room", "event"}` — `event` is an event ID: a string starting with `$`, no whitespace, at most 201 characters (`400` otherwise) | `200 {"redacted": true}` — the event is redacted (its content removed, irreversibly); `403` for the control room and for a room this plugin did not make; `502` when the homeserver refuses (for example the bot lacks the power to redact that event) |
 | `POST /room` | `{"name", "space"?}` — name ≤ 80 characters; `space`: `dev`, `orchestrator` or `rp` (else `400`) | `201 {"room", "space"?}` — private, encrypted from creation, the owner invited. With `space`, the room claims that sub-space (`m.space.parent`) and is listed in it (`m.space.child`); `space` is repeated, `null` if the listing failed (the room is made anyway), so a caller can tell that this version knew the field |
 | `POST /spaces` | `{}` | `200 {"spaces": {"parent", "dev", "orchestrator", "rp"}}` (room IDs) — missing spaces made, the control room, the `approval_room` and the sub-spaces linked into the parent; `502` |
 | `POST /place` | `{"room", "space"}` — the control room or a room this plugin made | `200 {"space"}` — listed in that sub-space unless it is already (no event is sent then); `400` bad space, `403` foreign room, `502` |
@@ -61,6 +62,35 @@ signed, stale or replayed request gets `401` without a signature, and `503` whil
 | `POST /avatar` | `{"room", "data"}` — a PNG as base64 (≤ 2 MiB), or `""` to remove | `200 {"avatar"}` — uploaded to the homeserver's media repository (**not encrypted**; only the homeserver's admin can delete it) and set as the avatar of the bot's own member event; the name stays. `400` not a PNG; `403` control room or foreign room; `413` |
 | `POST /roomicon` | `{"room", "data"}` — a PNG as base64 (≤ 2 MiB) | `200 {"icon": true}` — the room's icon (`m.room.avatar`), uploaded like `/avatar` |
 | `POST /archive` | `{"room", "name"}` | `200 {"archived": true}` — renames the room, takes it out of its space, then leaves it; never the control room |
+
+**Threads in events.** An event carries `thread` when the decrypted content of the owner's text or image message has
+`m.relates_to` with `rel_type` `m.thread` and a string `event_id`: that ID is the thread root. A thread reply also carries a
+fallback `m.in_reply_to` (Matrix spec, "Threading": `is_falling_back`), but only `rel_type == m.thread` counts; a plain reply
+(`m.in_reply_to` alone) is not in a thread and has no `thread` field. Edits (`m.replace`) are still dropped.
+
+**Formatted messages.** `/send` and `/edit` with `"markdown": true` send `body` as the raw text and add `format`
+`org.matrix.custom.html` and a `formatted_body` made by `core.markdown_html` (Matrix spec, `m.room.message` msgtypes: `body` is
+the plain version, `formatted_body` the HTML). For `/edit`, `m.new_content` and the outer fallback content both carry them (the
+outer text has `* ` in front, as before). The text is HTML-escaped **first** (`html.escape`, quotes included), and only then are
+markers turned into tags, so every tag in the result is one the converter wrote and nothing typed by the author (`<script>`,
+`<img onerror=…>`, attributes) can become markup, wherever it sits (inside emphasis, inside code). Converted, closed spans only:
+
+| Input | Output |
+|---|---|
+| fence of three backticks, optional language word, line break, code, closing fence | `<pre><code class="language-x">…</code></pre>`; the class only if the word matches `[A-Za-z0-9_+-]{1,20}`, else no class; nothing inside is converted, newlines stay |
+| `` `x` `` | `<code>x</code>`, nothing inside is converted |
+| `**x**` | `<strong>x</strong>` |
+| `*x*`, `_x_` | `<em>x</em>`; opening needs a non-space after it, closing a non-space before it, and neither touches a word character outside, so `snake_case` and `2 * 3 * 4` stay text |
+| newline | `<br>` outside fenced blocks |
+
+An unclosed marker stays literal. Spans are cut out one at a time, so overlapping markers (`**a *b** c*`) never make misnested
+tags. No links, no other tags, no attributes except that class; every tag used is on the spec's recommended list for clients
+(`pre`, `code`, `strong`, `em`, `br`; `class` on `code` only when it starts with `language-`).
+
+**Redaction.** `/redact` sends a Matrix redaction (`PUT /rooms/{roomId}/redact/{eventId}/{txnId}`, mautrix `client.redact`)
+for one event. Limits: only rooms this plugin made (the same check as every other room endpoint) and never the control room.
+Whether the homeserver accepts it is the homeserver's rule (the sender may redact their own events, others need the room's
+redact power level); a refusal comes back as the signed `502`. Not checked against a real server.
 
 **Events and restarts.** The caller confirms by sending the last sequence number it processed, so a lost answer only
 repeats messages. Every start of the plugin makes a new random `epoch`; a caller that sends another epoch gets all queued
@@ -120,7 +150,7 @@ pin is changed on the host. `pname` and `version` must equal `id` and `version` 
 ```nix
 sbxChat = config.services.maubot.package.plugins.buildMaubotPlugin {
   pname = "rocks.dag.sbx-chat";
-  version = "0.2.0";
+  version = "0.6.0";
   src = pkgs.fetchFromGitHub {
     owner = "d4g";
     repo = "maubot-sbx-chat";

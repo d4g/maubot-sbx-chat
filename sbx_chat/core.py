@@ -19,6 +19,7 @@ import base64
 import binascii
 import hashlib
 import hmac
+import html
 import re
 import secrets
 import time
@@ -180,12 +181,31 @@ def thread_relation(root: str) -> dict:
     return {"rel_type": "m.thread", "event_id": root, "is_falling_back": True, "m.in_reply_to": {"event_id": root}}
 
 
-def parse_edit(data) -> tuple[str, str, str]:
-    data = _object(data)
+def _event(data: dict) -> str:
     event = data.get("event")
     if not isinstance(event, str) or not EVENT.fullmatch(event):
         raise Refused(400, "bad event")
-    return _room(data), event, _text(data)
+    return event
+
+
+def parse_edit(data) -> tuple[str, str, str]:
+    data = _object(data)
+    return _room(data), _event(data), _text(data)
+
+
+def parse_redact(data) -> tuple[str, str]:
+    """(room, the event to redact): an event ID is a string that starts with `$` (EVENT: at most 201 characters, no whitespace)."""
+    data = _object(data)
+    return _room(data), _event(data)
+
+
+def parse_markdown(data) -> bool:
+    """`markdown` of /send and /edit: absent means False. Anything but a JSON boolean is refused, so that a typo such as
+    "yes" or 1 is an error at the caller instead of a message that silently goes out unformatted."""
+    value = _object(data).get("markdown", False)
+    if not isinstance(value, bool):
+        raise Refused(400, "bad markdown")
+    return value
 
 
 def parse_room(data) -> str:
@@ -290,12 +310,15 @@ class Inbox:
     seq: int = 0
     items: deque = field(default_factory=lambda: deque(maxlen=QUEUE_MAX))
 
-    def add(self, room: str, text: str, event: str, image: dict | None = None) -> int:
-        """image: {"id", "mime", "size"} of an attachment held in a MediaStore; the text is then its caption."""
+    def add(self, room: str, text: str, event: str, image: dict | None = None, thread: str | None = None) -> int:
+        """image: {"id", "mime", "size"} of an attachment held in a MediaStore; the text is then its caption.
+        thread: the event ID of the root of the Matrix thread the message was sent in (see thread_of), None outside a thread."""
         self.seq += 1
         item = {"seq": self.seq, "room": room, "text": text, "event": event}
         if image:
             item["image"] = image
+        if thread:
+            item["thread"] = thread
         self.items.append(item)
         return self.seq
 
@@ -344,9 +367,105 @@ def caption_of(content: dict) -> str:
     return ""
 
 
-def edit_content(event: str, text: str) -> dict:
-    return {"msgtype": "m.text", "body": "* " + text, "m.new_content": {"msgtype": "m.text", "body": text},
+# --- formatted text (a Markdown subset to HTML) ------------------------------------------------------------------
+
+HTML_FORMAT = "org.matrix.custom.html"
+# The word after an opening fence that becomes the class `language-<word>` of the code element (the Matrix spec lets a
+# client keep only classes that start with `language-`, for syntax highlighting). Anything else is not taken for a language.
+LANG = r"[A-Za-z0-9_+-]{1,20}"
+FENCE = re.compile(r"```(?:(" + LANG + r")[ \t]*\n|[ \t]*\n)?(.*?)```", re.DOTALL)
+INLINE_CODE = re.compile(r"`([^`\n]+)`")
+STRONG = re.compile(r"\*\*(?=[^\s*])(.+?)(?<=[^\s*])\*\*")
+# A single * or _ opens only before a non-space and closes only after a non-space, and neither may touch a word character on
+# its outer side: "2 * 3 * 4" and "snake_case_name" stay as they are.
+EM_STAR = re.compile(r"(?<![*\w])\*(?=[^\s*])([^*\n]+?)(?<=[^\s*])\*(?![*\w])")
+EM_UNDER = re.compile(r"(?<!\w)_(?=[^\s_])([^_\n]+?)(?<=[^\s_])_(?!\w)")
+
+
+def _em(text: str) -> str:
+    return EM_UNDER.sub(r"<em>\1</em>", EM_STAR.sub(r"<em>\1</em>", text))
+
+
+def _emphasis(text: str) -> str:
+    """**strong** and *em* / _em_ in text that is already escaped and holds no code. Strong is cut out first and its inside
+    and the rest are handled on their own, so spans can never overlap into misnested tags: `**a *b** c*` leaves the single
+    star literal. An unclosed marker has no match and stays as text."""
+    found = STRONG.search(text)
+    if not found:
+        return _em(text)
+    return _em(text[:found.start()]) + "<strong>" + _em(found.group(1)) + "</strong>" + _emphasis(text[found.end():])
+
+
+def _prose(text: str) -> str:
+    """Escaped text outside a fence: inline code first (nothing inside it is converted), emphasis in the pieces between, and
+    a line break for every newline."""
+    out, last = [], 0
+    for found in INLINE_CODE.finditer(text):
+        out.append(_emphasis(text[last:found.start()]))
+        out.append("<code>" + found.group(1) + "</code>")
+        last = found.end()
+    out.append(_emphasis(text[last:]))
+    return "".join(out).replace("\n", "<br>")
+
+
+def markdown_html(text: str) -> str:
+    """The `formatted_body` (format `org.matrix.custom.html`) for a text written in a small subset of Markdown.
+
+    Order matters and is the whole safety argument: the WHOLE text is HTML-escaped first (html.escape with quote=True, so
+    `<`, `>`, `&`, `"` and `'` become entities), and only then are markers turned into tags. Every tag in the result is
+    therefore one this function wrote; nothing the author typed (a <script>, an <img onerror=...>, an attribute) can reach the
+    output as markup. The markers themselves (backtick, star, underscore) are not touched by escaping, so they still work.
+
+    Only closed spans are converted; an unclosed marker stays literal text. Rules:
+      a fenced block (three backticks, an optional language word, a line break, the code, three backticks) becomes
+        <pre><code class="language-x">...</code></pre>; the word is kept only if it matches LANG, else the block has no
+        class; the inside is escaped text and nothing in it is converted
+      `x`        <code>x</code>, nothing inside converted
+      **x**      <strong>x</strong>
+      *x*, _x_   <em>x</em>; an underscore inside a word (snake_case) is never emphasis
+      newline    <br>, outside fenced blocks
+    No links, no other tags, no attributes except the class of a fenced block. `body` of the message stays the raw text."""
+    text = html.escape(text.replace("\r\n", "\n"), quote=True)
+    out, last = [], 0
+    for found in FENCE.finditer(text):
+        out.append(_prose(text[last:found.start()]))
+        lang, code = found.group(1), found.group(2)
+        if code.endswith("\n"):
+            code = code[:-1]                # the line break before the closing fence is not part of the code
+        out.append("<pre><code" + (f' class="language-{lang}"' if lang else "") + ">" + code + "</code></pre>")
+        last = found.end()
+    out.append(_prose(text[last:]))
+    return "".join(out)
+
+
+def message_content(text: str, markdown: bool = False) -> dict:
+    """Content of an m.text message. With `markdown` it also carries format and formatted_body (markdown_html); `body` is the
+    raw text either way, which is what a client without HTML shows."""
+    content = {"msgtype": "m.text", "body": text}
+    if markdown:
+        content.update({"format": HTML_FORMAT, "formatted_body": markdown_html(text)})
+    return content
+
+
+def edit_content(event: str, text: str, markdown: bool = False) -> dict:
+    """An m.replace edit. The outer content is the fallback for clients that do not know edits ("* " in front, as the spec
+    example shows) and carries the formatting too; m.new_content is what the message becomes."""
+    outer = message_content("* " + text)
+    if markdown:
+        outer.update({"format": HTML_FORMAT, "formatted_body": "* " + markdown_html(text)})
+    return {**outer, "m.new_content": message_content(text, markdown),
             "m.relates_to": {"rel_type": "m.replace", "event_id": event}}
+
+
+def thread_of(content: dict) -> str | None:
+    """The root of the Matrix thread an incoming message is in: m.relates_to with rel_type m.thread and an event_id. Only that
+    counts: a thread reply carries a fallback m.in_reply_to as well, but a plain reply (m.in_reply_to alone) is not in a thread."""
+    relates = content.get("m.relates_to")
+    if isinstance(relates, dict) and relates.get("rel_type") == "m.thread":
+        root = relates.get("event_id")
+        if isinstance(root, str) and EVENT.fullmatch(root):
+            return root
+    return None
 
 
 def is_edit(content: dict) -> bool:

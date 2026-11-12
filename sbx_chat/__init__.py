@@ -167,25 +167,31 @@ class SbxChat(Plugin):
 
     @web.post("/send")
     async def send(self, request: Request) -> Response:
+        """A message into a room of this plugin. Plain text unless `markdown` is true: then the text also goes out as HTML
+        built by core.markdown_html (escaped first, a few closed spans converted), and `body` stays the raw text. `markdown`
+        and `thread` are repeated in the answer, so that a caller can tell a plugin that knew the field from an older one
+        that ignored it (which would have sent the text unformatted, or into the main timeline)."""
         try:
             nonce, data = await self._read(request)
             room, text = core.parse_send(data)
             thread = core.parse_thread(data)
+            markdown = core.parse_markdown(data)
             await self._need_room(room)
-            if thread is None and self._hold(room, text):
+            known = {**({"thread": thread} if thread else {}), **({"markdown": True} if markdown else {})}
+            if thread is None and self._hold(room, text, markdown):
                 # 202: accepted, sent after the owner's join; there is no event ID yet. A reply in a thread is never held:
                 # it answers a message of this account, which the owner can only have read after the join.
-                return self._reply(nonce, 202, {"event": None, "held": True})
-            if thread is None:
+                return self._reply(nonce, 202, {"event": None, "held": True, **known})
+            if thread is None and not markdown:
                 event_id = await self.client.send_message(room, _message(text))
             else:
-                # A reply in the thread of `thread` (a message of this account, e.g. an answer): plain text, like _message.
-                event_id = await self.client.send_message_event(
-                    room, EventType.ROOM_MESSAGE,
-                    {"msgtype": "m.text", "body": text, "m.relates_to": core.thread_relation(thread)})
-            # `thread` in the answer tells the caller that this plugin knew the field: an older one would have sent the text
-            # into the room's main timeline and ignored it.
-            return self._reply(nonce, 201, {"event": event_id, **({"thread": thread} if thread else {})})
+                # A reply in the thread of `thread` (a message of this account, e.g. an answer), or a formatted message:
+                # built as a dict (plain text unless core.message_content adds the HTML).
+                content = core.message_content(text, markdown)
+                if thread:
+                    content["m.relates_to"] = core.thread_relation(thread)
+                event_id = await self.client.send_message_event(room, EventType.ROOM_MESSAGE, content)
+            return self._reply(nonce, 201, {"event": event_id, **known})
         except core.Refused as error:
             return self._refused(error)
         except Exception:
@@ -194,18 +200,41 @@ class SbxChat(Plugin):
 
     @web.post("/edit")
     async def edit(self, request: Request) -> Response:
+        """Replace an earlier message of this account (`m.replace`). `markdown` formats the new text as in /send and is
+        repeated in the answer when applied."""
         try:
             nonce, data = await self._read(request)
             room, event_id, text = core.parse_edit(data)
+            markdown = core.parse_markdown(data)
             await self._need_room(room)
             edit_id = await self.client.send_message_event(room, EventType.ROOM_MESSAGE,
-                                                           core.edit_content(event_id, text))
-            return self._reply(nonce, 200, {"event": edit_id})
+                                                           core.edit_content(event_id, text, markdown))
+            return self._reply(nonce, 200, {"event": edit_id, **({"markdown": True} if markdown else {})})
         except core.Refused as error:
             return self._refused(error)
         except Exception:
             self.log.exception("edit failed")
             return self._reply(await self._nonce_of(request), 502, {"error": "could not edit"})
+
+    @web.post("/redact")
+    async def redact(self, request: Request) -> Response:
+        """Redact (remove the content of) one event in a session room: the caller takes back a message, such as the status
+        line it posted for a turn. Never in the control room, and only in rooms this plugin made. Whether the homeserver lets
+        the bot redact a given event (its own always; the owner's depends on the room's power levels) is the homeserver's
+        decision: a refusal there is the signed 502."""
+        try:
+            nonce, data = await self._read(request)
+            room, event_id = core.parse_redact(data)
+            if room == self.config["room_id"]:
+                raise core.Refused(403, "nothing is redacted in the control room")
+            await self._need_room(room)
+            await self.client.redact(room, event_id)
+            return self._reply(nonce, 200, {"redacted": True})
+        except core.Refused as error:
+            return self._refused(error)
+        except Exception:
+            self.log.exception("redact failed")
+            return self._reply(await self._nonce_of(request), 502, {"error": "could not redact"})
 
     @web.post("/room")
     async def room(self, request: Request) -> Response:
@@ -490,8 +519,8 @@ class SbxChat(Plugin):
         except Exception:
             return {}
 
-    def _hold(self, room: str, text: str) -> bool:
-        """True if the text was kept for the owner's join. False if the room is not waiting for the owner, or has waited
+    def _hold(self, room: str, text: str, markdown: bool = False) -> bool:
+        """True if the text (and whether it is to be formatted) was kept for the owner's join. False if the room is not waiting for the owner, or has waited
         longer than HOLD_MAX: then whatever was held is dropped and the text is sent at once."""
         waiting = self.awaiting.get(room)
         if waiting is None:
@@ -500,7 +529,7 @@ class SbxChat(Plugin):
             self.awaiting.pop(room, None)
             self.log.warning("the owner never joined %s: dropped %d held message(s)", room, len(waiting[1]))
             return False
-        waiting[1].append(text)
+        waiting[1].append((text, markdown))
         return True
 
     @staticmethod
@@ -539,7 +568,7 @@ class SbxChat(Plugin):
             await self._note(evt.room_id, f"Message ignored: longer than {core.INBOUND_MAX // 1024} KiB.")
             return
         async with self.fresh:
-            self.inbox.add(evt.room_id, body, evt.event_id)
+            self.inbox.add(evt.room_id, body, evt.event_id, thread=core.thread_of(content))
             self.fresh.notify_all()
 
     async def _on_image(self, evt, content: dict) -> None:
@@ -574,7 +603,8 @@ class SbxChat(Plugin):
             return
         key = self.media.put(mime, data)
         async with self.fresh:
-            self.inbox.add(room, core.caption_of(content), evt.event_id, {"id": key, "mime": mime, "size": len(data)})
+            self.inbox.add(room, core.caption_of(content), evt.event_id, {"id": key, "mime": mime, "size": len(data)},
+                           core.thread_of(content))
             self.fresh.notify_all()
 
     @event.on(EventType.ROOM_MEMBER)
@@ -598,9 +628,13 @@ class SbxChat(Plugin):
                 self.log.exception("could not drop the group session of %s", evt.room_id)
         # Only now, with the new session, can the owner read the notices the daemon sent before the join.
         waiting = self.awaiting.pop(evt.room_id, None)
-        for text in waiting[1] if waiting else []:
+        for text, markdown in waiting[1] if waiting else []:
             try:
-                await self.client.send_message(evt.room_id, _message(text))
+                if markdown:
+                    await self.client.send_message_event(evt.room_id, EventType.ROOM_MESSAGE,
+                                                         core.message_content(text, True))
+                else:
+                    await self.client.send_message(evt.room_id, _message(text))
             except Exception:
                 self.log.exception("could not send a held message to %s", evt.room_id)
 
@@ -630,5 +664,5 @@ class SbxChat(Plugin):
 
 
 def _message(text: str) -> TextMessageEventContent:
-    """Plain text only: no HTML is built from the agent's text, so nothing in it can become markup."""
+    """Plain text only, the default of /send: no HTML is built unless the caller asks for `markdown` (core.message_content)."""
     return TextMessageEventContent(msgtype=MessageType.TEXT, body=text)

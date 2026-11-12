@@ -75,6 +75,7 @@ class FakeClient:
 
     def __init__(self):
         self.sent, self.created, self.left, self.state_keys, self.uploads = [], [], [], [], []
+        self.redacted = []
         self.spaces_made = 0
         self.api, self.crypto = FakeApi(), FakeCrypto()
         self.files = {}
@@ -122,6 +123,11 @@ class FakeClient:
 
     async def download_media(self, url):
         return self.files[url]
+
+    async def redact(self, room_id, event_id, reason=None):
+        """mautrix's signature: redact(room_id, event_id, reason=None, extra_content=None, **kwargs) -> event ID."""
+        self.redacted.append((room_id, event_id, reason))
+        return f"$red{len(self.redacted)}"
 
     async def leave_room(self, room):
         self.left.append(room)
@@ -799,3 +805,149 @@ async def test_two_requests_at_once_make_the_spaces_once(setup):
     answers = await asyncio.gather(*[call(client, "/place", {"room": SESSION, "space": key})
                                      for key in ("dev", "orchestrator", "rp", "dev")])
     assert [a[0] for a in answers] == [200] * 4 and plugin.client.spaces_made == 4
+
+
+# --- formatted messages, threads in, redaction --------------------------------------------------------------------
+
+import re  # noqa: E402
+
+THREAD = {"rel_type": "m.thread", "event_id": "$root:example.org", "is_falling_back": True,
+          "m.in_reply_to": {"event_id": "$last:example.org"}}
+
+
+async def test_event_in_a_thread_carries_the_root(setup):
+    plugin, client = setup
+    await plugin.on_message(message(plugin, "in thread", extra={"m.relates_to": THREAD}))
+    await plugin.on_message(message(plugin, "plain"))
+    await plugin.on_message(message(plugin, "reply", extra={"m.relates_to": {"m.in_reply_to": {"event_id": "$x"}}}))
+    await plugin.on_message(image(plugin))
+    first, plain, reply, picture = await events(client)
+    assert first["thread"] == "$root:example.org" and first["text"] == "in thread"
+    assert set(first) == {"seq", "room", "text", "event", "thread"}
+    assert "thread" not in plain and "thread" not in reply and "thread" not in picture
+
+
+async def test_image_in_a_thread_carries_the_root(setup):
+    plugin, client = setup
+    evt = image(plugin, caption="what?")
+    plugin.client.crypto.plain[evt.event_id]["content"]["m.relates_to"] = THREAD
+    await plugin.on_message(evt)
+    [item] = await events(client)
+    assert item["thread"] == "$root:example.org" and item["image"]["mime"] == "image/png" and item["text"] == "what?"
+
+
+async def test_an_edit_in_a_thread_is_still_dropped(setup):
+    plugin, client = setup
+    await plugin.on_message(message(plugin, "x", extra={"m.relates_to": {"rel_type": "m.replace", "event_id": "$o"}}))
+    assert await events(client) == []
+
+
+MARKDOWN_TEXT = "**bold** _it_ `c`\n```py\nx = 1\n```"
+
+
+async def test_send_markdown(setup):
+    plugin, client = setup
+    status, body, signed = await call(client, "/send", {"room": SESSION, "text": MARKDOWN_TEXT, "markdown": True})
+    assert (status, signed) == (201, True) and body == {"event": "$ev1", "markdown": True}
+    assert plugin.client.sent[-1] == (SESSION, "m.room.message", {
+        "msgtype": "m.text", "body": MARKDOWN_TEXT, "format": "org.matrix.custom.html",
+        "formatted_body": '<strong>bold</strong> <em>it</em> <code>c</code><br>'
+                          '<pre><code class="language-py">x = 1</code></pre>'})
+
+
+async def test_send_without_markdown_or_with_false_is_plain(setup):
+    plugin, client = setup
+    for extra in ({}, {"markdown": False}):
+        status, body, _ = await call(client, "/send", {"room": SESSION, "text": "**x**", **extra})
+        assert status == 201 and "markdown" not in body
+        content = plugin.client.sent[-1][2]
+        assert content["body"] == "**x**" and "formatted_body" not in content and "format" not in content
+
+
+async def test_send_markdown_must_be_a_boolean(setup):
+    plugin, client = setup
+    for bad in ("true", 1, None, []):
+        assert (await call(client, "/send", {"room": SESSION, "text": "x", "markdown": bad}))[0] == 400, bad
+        assert (await call(client, "/edit", {"room": SESSION, "event": "$e", "text": "x", "markdown": bad}))[0] == 400
+    assert plugin.client.sent == []
+
+
+async def test_send_markdown_is_escaped_in_the_room(setup):
+    plugin, client = setup
+    for text in ("<script>alert(1)</script>", "**<b>x</b>**", "```\n<img src=x onerror=alert(1)>\n```",
+                 "`<img src=x onerror=alert(1)>`"):
+        assert (await call(client, "/send", {"room": SESSION, "text": text, "markdown": True}))[0] == 201
+        content = plugin.client.sent[-1][2]
+        assert content["body"] == text
+        rest = re.sub(r"</?(?:pre|code|strong|em|br)>", "", content["formatted_body"])
+        assert "<" not in rest and ">" not in rest, content["formatted_body"]
+
+
+async def test_send_markdown_in_a_thread(setup):
+    plugin, client = setup
+    status, body, signed = await call(client, "/send", {"room": SESSION, "text": "**x**", "thread": "$answer:example.org",
+                                                        "markdown": True})
+    assert (status, signed) == (201, True) and body == {"event": "$ev1", "thread": "$answer:example.org", "markdown": True}
+    assert plugin.client.sent[-1][2] == {
+        "msgtype": "m.text", "body": "**x**", "format": "org.matrix.custom.html", "formatted_body": "<strong>x</strong>",
+        "m.relates_to": {"rel_type": "m.thread", "event_id": "$answer:example.org", "is_falling_back": True,
+                         "m.in_reply_to": {"event_id": "$answer:example.org"}}}
+
+
+async def test_edit_markdown(setup):
+    plugin, client = setup
+    status, body, signed = await call(client, "/edit", {"room": SESSION, "event": "$ev1", "text": "**new** <b>",
+                                                        "markdown": True})
+    assert (status, signed) == (200, True) and body == {"event": "$ev1", "markdown": True}
+    assert plugin.client.sent[-1][2] == {
+        "msgtype": "m.text", "body": "* **new** <b>", "format": "org.matrix.custom.html",
+        "formatted_body": "* <strong>new</strong> &lt;b&gt;",
+        "m.new_content": {"msgtype": "m.text", "body": "**new** <b>", "format": "org.matrix.custom.html",
+                          "formatted_body": "<strong>new</strong> &lt;b&gt;"},
+        "m.relates_to": {"rel_type": "m.replace", "event_id": "$ev1"}}
+    # without it: as before, no formatting and no `markdown` in the answer
+    status, body, _ = await call(client, "/edit", {"room": SESSION, "event": "$ev1", "text": "new"})
+    assert body == {"event": "$ev2"} and "formatted_body" not in plugin.client.sent[-1][2]
+    assert "formatted_body" not in plugin.client.sent[-1][2]["m.new_content"]
+
+
+async def test_held_markdown_is_formatted_when_the_owner_joins(setup):
+    plugin, client = setup
+    room = "!new:example.org"
+    plugin.client.creators[room] = BOT
+    await call(client, "/room", {"name": "local/x"})
+    status, body, _ = await call(client, "/send", {"room": room, "text": "**a**", "markdown": True})
+    assert (status, body) == (202, {"event": None, "held": True, "markdown": True})
+    assert (await call(client, "/send", {"room": room, "text": "**b**"}))[1] == {"event": None, "held": True}
+    await plugin.on_member(member(room, OWNER, Membership.JOIN))
+    first, second = [c[2] for c in plugin.client.sent]
+    assert first["formatted_body"] == "<strong>a</strong>" and first["body"] == "**a**"
+    assert second == {"msgtype": "m.text", "body": "**b**"}
+
+
+async def test_redact(setup):
+    plugin, client = setup
+    assert await call(client, "/redact", {"room": SESSION, "event": "$ev1:example.org"}) == (200, {"redacted": True}, True)
+    assert plugin.client.redacted == [(SESSION, "$ev1:example.org", None)]
+
+
+async def test_redact_refusals(setup):
+    plugin, client = setup
+    assert (await call(client, "/redact", {"room": CONTROL, "event": "$e"}))[0] == 403
+    assert (await call(client, "/redact", {"room": FOREIGN, "event": "$e"}))[0] == 403
+    for bad in ({"room": SESSION}, {"room": SESSION, "event": "e"}, {"room": SESSION, "event": "$a b"},
+                {"room": SESSION, "event": 5}, {"room": SESSION, "event": "$" + "x" * 201}, {"event": "$e"}):
+        assert (await call(client, "/redact", bad))[0] == 400, bad
+    assert (await call(client, "/redact", {"room": SESSION, "event": "$e"}, secret="x" * 40))[0] == 401
+    assert plugin.client.redacted == []
+
+
+async def test_redact_failure_is_a_signed_502(setup):
+    plugin, client = setup
+
+    async def fail(room_id, event_id, reason=None):
+        raise RuntimeError("no power")
+
+    plugin.client.redact = fail
+    status, body, signed = await call(client, "/redact", {"room": SESSION, "event": "$e"})
+    assert (status, signed, body) == (502, True, {"error": "could not redact"})
