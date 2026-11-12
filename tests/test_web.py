@@ -653,6 +653,30 @@ async def test_a_crash_between_two_spaces_does_not_make_a_second_copy(setup):
     assert plugin.client.spaces_made == 4                 # parent, dev, then orchestrator and rp: four in all, none twice
 
 
+async def test_spaces_makes_the_layout_without_a_room(setup):
+    plugin, client = setup
+    status, body, signed = await call(client, "/spaces", {})
+    assert status == 200 and signed
+    assert body == {"spaces": {"parent": "!space1:example.org", "dev": "!space2:example.org",
+                               "orchestrator": "!space3:example.org", "rp": "!space4:example.org"}}
+    assert children(plugin, "!space1:example.org") == sorted(["!space2:example.org", "!space3:example.org",
+                                                              "!space4:example.org", CONTROL, APPROVAL])
+    assert children(plugin, "!space2:example.org") == []
+    assert (await call(client, "/spaces", {}))[:2] == (200, body)     # a second call makes nothing new
+    assert plugin.client.spaces_made == 4
+
+
+async def test_spaces_failure_is_a_signed_502(setup):
+    plugin, client = setup
+
+    async def gone(**kwargs):
+        raise RuntimeError("homeserver gone")
+
+    plugin.client.create_room = gone
+    status, body, signed = await call(client, "/spaces", {})
+    assert (status, signed) == (502, True) and body == {"error": "could not make the spaces"}
+
+
 async def test_room_without_space_is_unchanged(setup):
     plugin, client = setup
     assert await call(client, "/room", {"name": "local/x"}) == (201, {"room": "!new:example.org"}, True)

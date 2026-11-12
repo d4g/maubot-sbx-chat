@@ -271,6 +271,23 @@ class SbxChat(Plugin):
             self.log.exception("place failed")
             return self._reply(await self._nonce_of(request), 502, {"error": "could not place the room"})
 
+    @web.post("/spaces")
+    async def spaces(self, request: Request) -> Response:
+        """Make the spaces that are missing and link the fixed rooms (control room, approval room, sub-spaces) into the parent,
+        without a room to place. The caller sends it once when it starts, so that the layout exists and the control room is
+        in it even when there is no session yet (/room and /place would otherwise be the first to make it). The body is an
+        empty JSON object; it is signed like every other request."""
+        try:
+            nonce, _ = await self._read(request)
+            await self._ensure_spaces()
+            return self._reply(nonce, 200, {"spaces": {key: self.config[f"spaces.{key}"]
+                                                       for key in ("parent", *core.SUBSPACES)}})
+        except core.Refused as error:
+            return self._refused(error)
+        except Exception:
+            self.log.exception("making the spaces failed")
+            return self._reply(await self._nonce_of(request), 502, {"error": "could not make the spaces"})
+
     @web.post("/archive")
     async def archive(self, request: Request) -> Response:
         """Rename a session room, take it out of its space, then leave it. The owner keeps the room and its history; the
@@ -379,7 +396,7 @@ class SbxChat(Plugin):
         Layout: the parent space "Agent sandbox" holds the control room, the approval room of sbx-approval (config
         `approval_room`) and three sub-spaces (core.SUBSPACES). All are private (invite only), not in the room directory,
         and not encrypted: a space carries no messages, only names and links, which the owner's own homeserver sees anyway.
-        The owner is invited and gets power level 100 next to the bot, so he can move rooms in and out himself.
+        The owner is invited and gets power level 100 next to the bot, so the owner can move rooms in and out by hand.
 
         The IDs are the plugin's own state, kept in the instance config (`spaces.*`) and saved after every space made, so a
         crash or restart between two creations cannot make a second copy. A space the owner deleted is not noticed: its ID

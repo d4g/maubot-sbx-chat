@@ -49,7 +49,7 @@ MEDIA_BYTES = 50 * 1024 * 1024
 MEDIA_ID = re.compile(r"[A-Za-z0-9_-]{16,64}")
 WAIT_MAX = 30
 # The sub-spaces a session room can be put in (the keys of the config's `spaces`, besides `parent`) and the names they are
-# created with. The owner sees the names in Element, so these are what he reads; the keys are what the caller sends.
+# created with. The owner sees the names in Element, so these are what the owner reads; the keys are what the caller sends.
 SUBSPACES = {"dev": "Dev", "orchestrator": "Orchestrator", "rp": "Rollenspiel"}
 PARENT_SPACE = "Agent sandbox"
 

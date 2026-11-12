@@ -55,6 +55,7 @@ signed, stale or replayed request gets `401` without a signature, and `503` whil
 | `POST /send` | `{"room", "text", "thread"?}` — text ≤ 30 KiB UTF-8, plain (no markup is built from it); `thread`: the event ID of a message this account sent, then the text is a reply in that message's thread (`m.thread`), as maubot-sbx-approval does for its detail | `201 {"event", "thread"?}` (`thread` repeated, so a caller can tell that this version knew the field); `403` not a room of this plugin; `413`; `502` |
 | `POST /edit` | `{"room", "event", "text"}` — replaces an earlier message of this account (`m.replace`) | `200 {"event"}` |
 | `POST /room` | `{"name", "space"?}` — name ≤ 80 characters; `space`: `dev`, `orchestrator` or `rp` (else `400`) | `201 {"room", "space"?}` — private, encrypted from creation, the owner invited. With `space`, the room claims that sub-space (`m.space.parent`) and is listed in it (`m.space.child`); `space` is repeated, `null` if the listing failed (the room is made anyway), so a caller can tell that this version knew the field |
+| `POST /spaces` | `{}` | `200 {"spaces": {"parent", "dev", "orchestrator", "rp"}}` (room IDs) — missing spaces made, the control room, the `approval_room` and the sub-spaces linked into the parent; `502` |
 | `POST /place` | `{"room", "space"}` — the control room or a room this plugin made | `200 {"space"}` — listed in that sub-space unless it is already (no event is sent then); `400` bad space, `403` foreign room, `502` |
 | `POST /nick` | `{"room", "name"}` — one line, ≤ 80 characters | `200 {"nick"}` — the bot's own display name in that room (its own member event, avatar kept); `403` for the control room or a foreign room |
 | `POST /avatar` | `{"room", "data"}` — a PNG as base64 (≤ 2 MiB), or `""` to remove | `200 {"avatar"}` — uploaded to the homeserver's media repository (**not encrypted**; only the homeserver's admin can delete it) and set as the avatar of the bot's own member event; the name stays. `400` not a PNG; `403` control room or foreign room; `413` |
@@ -84,11 +85,11 @@ way; a caller must check it before it trusts the answer. `core.sign_request` and
 
 ## Spaces
 
-The owner's room list stays ordered by Matrix spaces, which the plugin makes itself the first time a room is placed (`/room`
-with `space`, or `/place`): a parent space "Agent sandbox" (the control room, the `approval_room`, and three sub-spaces) and
+The owner's room list stays ordered by Matrix spaces, which the plugin makes itself on the first `/spaces` (the caller sends it when it
+starts), or the first time a room is placed (`/room` with `space`, or `/place`): a parent space "Agent sandbox" (the control room, the `approval_room`, and three sub-spaces) and
 the sub-spaces "Dev", "Orchestrator" and "Rollenspiel". They are private (invite only, not in the directory), **not
 encrypted** (a space carries only names and links, which the owner's own homeserver sees anyway), and the owner is invited
-with power level 100 next to the bot so he can move rooms himself. Their IDs are saved with the instance config
+with power level 100 next to the bot so the owner can move rooms by hand. Their IDs are saved with the instance config
 (`spaces.*`, `self.config.save()`) right after each is made, so a restart never makes a second copy. A space the owner
 deletes is not noticed; empty its key to have a new one made. Linking is best effort and never fails a request.
 
