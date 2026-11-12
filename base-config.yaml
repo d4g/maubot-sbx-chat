@@ -6,3 +6,14 @@ room_id: ""
 # Shared secret with the caller (sbx-chat on VM 130), at least 32 characters. Never sent over the wire: requests and
 # responses are signed with HMAC-SHA256 over it. While it is empty or shorter, every request is refused.
 secret: ""
+# The approval room of maubot-sbx-approval (internal room ID, "!...:server"), optional. It is put into the parent space
+# "Agent sandbox" next to the control room; empty means it is left where it is.
+approval_room: ""
+# Matrix spaces that order the rooms in the owner's room list. Filled by this plugin itself the first time a room is placed:
+# it creates them (private, owner invited, power level 100) and saves the IDs here. Leave them empty at first. Emptying one
+# makes the plugin create a new space for it.
+spaces:
+  parent: ""
+  dev: ""
+  orchestrator: ""
+  rp: ""

@@ -147,3 +147,24 @@ def test_inbox_item_carries_the_image():
     inbox.add("!r", "t", "$f")
     first, second = inbox.since(None, 0)
     assert first["image"]["id"] == "i" and "image" not in second
+
+
+def test_parse_space_and_place():
+    assert core.parse_space({}) is None and core.parse_space({"space": None}) is None
+    assert [core.parse_space({"space": k}) for k in ("dev", "orchestrator", "rp")] == ["dev", "orchestrator", "rp"]
+    for bad in ("parent", "", "Dev", 1, ["dev"]):
+        with pytest.raises(core.Refused) as error:
+            core.parse_space({"space": bad})
+        assert error.value.status == 400
+    with pytest.raises(core.Refused):
+        core.parse_space({}, required=True)
+    assert core.parse_place({"room": "!r:x", "space": "rp"}) == ("!r:x", "rp")
+    with pytest.raises(core.Refused):
+        core.parse_place({"room": "r", "space": "rp"})
+
+
+def test_space_links():
+    assert core.space_link("example.org") == {"via": ["example.org"]}
+    assert core.space_link("example.org", canonical=True) == {"via": ["example.org"], "canonical": True}
+    assert core.has_link({"via": ["example.org"]}) and not core.has_link({}) and not core.has_link({"via": []})
+    assert not core.has_link({"via": "example.org"}) and not core.has_link(None)

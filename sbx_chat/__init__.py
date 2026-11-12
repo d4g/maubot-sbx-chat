@@ -1,5 +1,6 @@
 """maubot glue of sbx-chat: the HTTP endpoints for sbx-chat on VM 130, and the owner's messages as events.
-Logic in core.py. The plugin keeps no session state: VM 130 owns the mapping of rooms to sessions."""
+Logic in core.py. The plugin keeps no session state: VM 130 owns the mapping of rooms to sessions. The only thing it
+remembers itself is the IDs of the Matrix spaces it made (instance config `spaces`), see _ensure_spaces."""
 from __future__ import annotations
 
 import asyncio
@@ -29,7 +30,8 @@ ENCRYPTION = {"type": "m.room.encryption", "state_key": "", "content": {"algorit
 
 class Config(BaseProxyConfig):
     def do_update(self, helper: ConfigUpdateHelper) -> None:
-        for key in ("owner", "room_id", "secret"):
+        for key in ("owner", "room_id", "secret", "approval_room", "spaces.parent", "spaces.dev", "spaces.orchestrator",
+                    "spaces.rp"):
             helper.copy(key)
 
 
@@ -44,6 +46,11 @@ class SbxChat(Plugin):
     # before the join cannot be read by the owner (see on_member), so /send holds it here and on_member sends it after.
     # Not persistent: after a plugin restart a send goes out at once.
     awaiting: dict[str, list]
+    # Serialises _ensure_spaces: two requests arriving together must not both create the same space.
+    spaces_lock: asyncio.Lock
+    # (space, room) pairs known to be linked by an m.space.child, so that the start-up pass of the caller (one /place per
+    # session) does not read the same state again with every request. Not persistent: after a restart each is read once.
+    linked: set[tuple[str, str]]
 
     @classmethod
     def get_config_class(cls) -> type[BaseProxyConfig]:
@@ -57,6 +64,8 @@ class SbxChat(Plugin):
         self.fresh = asyncio.Condition()
         self.own_rooms = {}
         self.awaiting = {}
+        self.spaces_lock = asyncio.Lock()
+        self.linked = set()
         if self._secret() is None:
             self.log.warning("secret missing or shorter than %d characters: every request is refused", core.SECRET_MIN)
 
@@ -201,24 +210,71 @@ class SbxChat(Plugin):
     @web.post("/room")
     async def room(self, request: Request) -> Response:
         """An end-to-end encrypted private room with the owner invited. Encryption is part of the creation, so no
-        message can ever be sent into the room unencrypted."""
+        message can ever be sent into the room unencrypted.
+
+        With `space` (one of core.SUBSPACES) the room is also put into that sub-space: the new room claims it with an
+        m.space.parent in its initial state, and the space lists it with an m.space.child. A failure there never fails the
+        request (a session must not depend on how its room is sorted): the room is returned with `"space": null` and the
+        reason is logged. The answer repeats `space` so that the caller can tell a plugin that knew the field from an older
+        one, which would have ignored it."""
         try:
             nonce, data = await self._read(request)
             name = core.parse_room(data)
+            space = core.parse_space(data)
+            space_id = None
+            if space:
+                try:
+                    await self._ensure_spaces()
+                    space_id = self.config[f"spaces.{space}"] or None
+                except Exception:
+                    self.log.exception("could not make the spaces; the room is made without one")
+            initial_state = [ENCRYPTION]
+            if space_id:
+                initial_state.append({"type": "m.space.parent", "state_key": space_id,
+                                      "content": core.space_link(self._server(), canonical=True)})
             room_id = await self.client.create_room(name=name, invitees=[self.config["owner"]], is_direct=False,
-                                                    initial_state=[ENCRYPTION])
+                                                    initial_state=initial_state)
             self.own_rooms[room_id] = True
             self.awaiting[room_id] = [time.monotonic(), []]
-            return self._reply(nonce, 201, {"room": room_id})
+            answer = {"room": room_id}
+            if space:
+                answer["space"] = None
+                if space_id:
+                    try:
+                        await self._add_child(space_id, room_id)
+                        answer["space"] = space
+                    except Exception:
+                        self.log.exception("could not put %s into the space %s", room_id, space)
+            return self._reply(nonce, 201, answer)
         except core.Refused as error:
             return self._refused(error)
         except Exception:
             self.log.exception("room creation failed")
             return self._reply(await self._nonce_of(request), 502, {"error": "could not create the room"})
 
+    @web.post("/place")
+    async def place(self, request: Request) -> Response:
+        """Put a room of this plugin (the control room or one it made) into a sub-space, if it is not in it yet. For rooms
+        that exist already: the caller sends every session room it knows when it starts. Only the m.space.child in the space
+        is set (the bot has power there); the room's own m.space.parent is left alone, since a room made before the spaces
+        existed need not give the bot the power to change it."""
+        try:
+            nonce, data = await self._read(request)
+            room, space = core.parse_place(data)
+            await self._need_room(room)
+            await self._ensure_spaces()
+            await self._add_child(self.config[f"spaces.{space}"], room)
+            return self._reply(nonce, 200, {"space": space})
+        except core.Refused as error:
+            return self._refused(error)
+        except Exception:
+            self.log.exception("place failed")
+            return self._reply(await self._nonce_of(request), 502, {"error": "could not place the room"})
+
     @web.post("/archive")
     async def archive(self, request: Request) -> Response:
-        """Rename a session room, then leave it. The owner keeps the room and its history; the bot does not."""
+        """Rename a session room, take it out of its space, then leave it. The owner keeps the room and its history; the
+        bot does not."""
         try:
             nonce, data = await self._read(request)
             room, name = core.parse_archive(data)
@@ -226,6 +282,7 @@ class SbxChat(Plugin):
                 raise core.Refused(403, "the control room is never archived")
             await self._need_room(room)
             await self.client.send_state_event(room, EventType.ROOM_NAME, {"name": name})
+            await self._unplace(room)
             await self.client.leave_room(room)
             self.own_rooms.pop(room, None)
             self.awaiting.pop(room, None)
@@ -309,6 +366,104 @@ class SbxChat(Plugin):
         except Exception:
             self.log.exception("room icon failed")
             return self._reply(await self._nonce_of(request), 502, {"error": "could not set the room icon"})
+
+    # --- spaces -----------------------------------------------------------------------------------------------
+
+    def _server(self) -> str:
+        """The homeserver part of the bot's MXID: the `via` of every space link (all rooms here live on that server)."""
+        return self.client.mxid.split(":", 1)[1]
+
+    async def _ensure_spaces(self) -> None:
+        """Make the spaces that do not exist yet, and link the fixed rooms into the parent space.
+
+        Layout: the parent space "Agent sandbox" holds the control room, the approval room of sbx-approval (config
+        `approval_room`) and three sub-spaces (core.SUBSPACES). All are private (invite only), not in the room directory,
+        and not encrypted: a space carries no messages, only names and links, which the owner's own homeserver sees anyway.
+        The owner is invited and gets power level 100 next to the bot, so he can move rooms in and out himself.
+
+        The IDs are the plugin's own state, kept in the instance config (`spaces.*`) and saved after every space made, so a
+        crash or restart between two creations cannot make a second copy. A space the owner deleted is not noticed: its ID
+        stays in the config until someone empties it there. Linking is best effort (logged, never raised): a bad
+        `approval_room` must not keep the session rooms from their space. A failure to make a space is raised."""
+        async with self.spaces_lock:
+            parent = await self._make_space("parent", core.PARENT_SPACE, None)
+            for key, name in core.SUBSPACES.items():
+                await self._make_space(key, name, parent)
+            for room in (self.config["room_id"], self.config["approval_room"]):
+                if room:
+                    try:
+                        await self._add_child(parent, room)
+                    except Exception:
+                        self.log.exception("could not put %s into the parent space", room)
+
+    async def _make_space(self, key: str, name: str, parent: str | None) -> str:
+        """The ID of the space `key` from the config; made, saved and (for a sub-space) linked below `parent` if missing."""
+        existing = self.config[f"spaces.{key}"]
+        if existing:
+            if parent:
+                try:
+                    await self._add_child(parent, existing)    # a no-op if it is linked; repairs a link lost after a crash
+                except Exception:
+                    self.log.exception("could not put the space %s into the parent space", key)
+            return existing
+        owner, bot = self.config["owner"], self.client.mxid
+        initial_state = []
+        if parent:
+            initial_state.append({"type": "m.space.parent", "state_key": parent,
+                                  "content": core.space_link(self._server(), canonical=True)})
+        # events_default 100: only the owner and the bot may post into a space (nobody should chat there).
+        space = await self.client.create_room(
+            name=name, invitees=[owner], is_direct=False, initial_state=initial_state,
+            creation_content={"type": "m.space"},
+            power_level_override={"users": {bot: 100, owner: 100}, "events_default": 100})
+        self.config[f"spaces.{key}"] = space
+        self.config.save()
+        self.log.info("made the space %s (%s)", name, space)
+        if parent:
+            try:
+                await self._add_child(parent, space)
+            except Exception:
+                self.log.exception("could not put the new space %s into the parent space", key)
+        return space
+
+    async def _child_linked(self, space: str, room: str) -> bool:
+        """True if `space` has a live m.space.child for `room`. Unreadable (never set: 404) counts as not linked."""
+        try:
+            content = await self.client.api.request(Method.GET, Path.v3.rooms[space].state["m.space.child"][room])
+        except Exception:
+            return False
+        return core.has_link(content)
+
+    async def _add_child(self, space: str, room: str) -> None:
+        """List `room` as a child of `space`. The current state is read first and nothing is sent if the link is live, so
+        the start-up pass (one call per existing session) leaves no new events in the space's timeline."""
+        if (space, room) in self.linked:
+            return
+        if not await self._child_linked(space, room):
+            await self.client.send_state_event(space, EventType.SPACE_CHILD, core.space_link(self._server()),
+                                               state_key=room)
+        self.linked.add((space, room))
+
+    async def _remove_child(self, space: str, room: str) -> None:
+        """Take `room` out of `space`: an m.space.child with empty content is a removed link (Matrix spec)."""
+        await self.client.send_state_event(space, EventType.SPACE_CHILD, {}, state_key=room)
+        self.linked.discard((space, room))
+
+    async def _unplace(self, room: str) -> None:
+        """Take a room out of every sub-space it is listed in, and withdraw its own m.space.parent claim there (while the bot
+        is still a member, so it can). All sub-spaces are checked: the plugin does not record which one a room is in. Every
+        failure is logged only: a room must be archivable even when its space is not reachable."""
+        for key in core.SUBSPACES:
+            space = self.config[f"spaces.{key}"]
+            if not space:
+                continue
+            try:
+                if (space, room) not in self.linked and not await self._child_linked(space, room):
+                    continue
+                await self._remove_child(space, room)
+                await self.client.send_state_event(room, EventType.SPACE_PARENT, {}, state_key=space)
+            except Exception:
+                self.log.exception("could not take %s out of the space %s", room, key)
 
     async def _own_member(self, room: str) -> dict:
         """The bot's current member event content in a room, {} if it cannot be read."""

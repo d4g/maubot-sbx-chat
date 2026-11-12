@@ -48,6 +48,10 @@ MEDIA_COUNT = 5
 MEDIA_BYTES = 50 * 1024 * 1024
 MEDIA_ID = re.compile(r"[A-Za-z0-9_-]{16,64}")
 WAIT_MAX = 30
+# The sub-spaces a session room can be put in (the keys of the config's `spaces`, besides `parent`) and the names they are
+# created with. The owner sees the names in Element, so these are what he reads; the keys are what the caller sends.
+SUBSPACES = {"dev": "Dev", "orchestrator": "Orchestrator", "rp": "Rollenspiel"}
+PARENT_SPACE = "Agent sandbox"
 
 
 class Refused(Exception):
@@ -186,6 +190,36 @@ def parse_edit(data) -> tuple[str, str, str]:
 
 def parse_room(data) -> str:
     return _name(_object(data))
+
+
+def parse_space(data, required: bool = False) -> str | None:
+    """The sub-space (`space`, one of SUBSPACES) a room is to be put in; None if the field is absent and not `required`."""
+    space = _object(data).get("space")
+    if space is None and not required:
+        return None
+    if not isinstance(space, str) or space not in SUBSPACES:
+        raise Refused(400, "bad space")
+    return space
+
+
+def parse_place(data) -> tuple[str, str]:
+    data = _object(data)
+    return _room(data), parse_space(data, required=True)
+
+
+def space_link(server: str, canonical: bool = False) -> dict:
+    """Content of an m.space.child (sent into the space, state_key = the room) or of an m.space.parent (sent into the room,
+    state_key = the space). Both need `via`, the servers to join through: without it a client ignores the link, and a child
+    event with empty content or no `via` means "removed" (Matrix spec, "Spaces",
+    https://spec.matrix.org/v1.11/client-server-api/#spaces). `canonical` marks the primary parent and exists on
+    m.space.parent only."""
+    return {"via": [server], **({"canonical": True} if canonical else {})}
+
+
+def has_link(content) -> bool:
+    """True if an m.space.child as read from the server is a live link: a non-empty `via` list."""
+    via = content.get("via") if isinstance(content, dict) else None
+    return isinstance(via, list) and bool(via)
 
 
 def parse_nick(data) -> tuple[str, str]:

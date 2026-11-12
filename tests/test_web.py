@@ -37,9 +37,14 @@ PREFIX = "/_matrix/maubot/plugin/chat"
 class FakeApi:
     def __init__(self):
         self.stored = {}
+        # (space, child room) -> content of the m.space.child as the server holds it; absent = never set (a real 404).
+        self.children = {}
 
     async def request(self, method, path, **kwargs):
-        return self.stored[urllib.parse.unquote(str(path).rsplit("/", 1)[-1])]
+        parts = [urllib.parse.unquote(p) for p in str(path).split("/")]
+        if "m.space.child" in parts:
+            return self.children[(parts[parts.index("rooms") + 1], parts[-1])]
+        return self.stored[parts[-1]]
 
 
 class FakeCryptoStore:
@@ -70,6 +75,7 @@ class FakeClient:
 
     def __init__(self):
         self.sent, self.created, self.left, self.state_keys, self.uploads = [], [], [], [], []
+        self.spaces_made = 0
         self.api, self.crypto = FakeApi(), FakeCrypto()
         self.files = {}
         # Who created which room, as the state of the room says.
@@ -96,10 +102,18 @@ class FakeClient:
             content.pop("is_direct", None)             # the default of MemberStateEventContent, not what the tests are about
         self.sent.append((room, str(event_type), content))
         self.state_keys.append(state_key)
+        if str(event_type) == "m.space.child":
+            if content:
+                self.api.children[(room, state_key)] = content
+            else:
+                self.api.children.pop((room, state_key), None)     # a real server keeps an empty event; same for has_link
         return "$state"
 
     async def create_room(self, **kwargs):
         self.created.append(kwargs)
+        if (kwargs.get("creation_content") or {}).get("type") == "m.space":
+            self.spaces_made += 1
+            return f"!space{self.spaces_made}:example.org"
         return "!new:example.org"
 
     async def upload_media(self, data, mime_type=None, filename=None):
@@ -113,9 +127,30 @@ class FakeClient:
         self.left.append(room)
 
 
+class FakeConfig:
+    """What the plugin uses of maubot's BaseProxyConfig: dotted keys, and save() (counted)."""
+
+    def __init__(self, **values):
+        self.values, self.saves = dict(values), 0
+
+    def __getitem__(self, key):
+        return self.values.get(key)
+
+    def __setitem__(self, key, value):
+        self.values[key] = value
+
+    def save(self):
+        self.saves += 1
+
+
+APPROVAL = "!approval:example.org"
+
+
 def make_plugin():
     plugin = object.__new__(sbx_chat.SbxChat)
-    plugin.config = {"owner": OWNER, "room_id": CONTROL, "secret": SECRET}
+    plugin.config = FakeConfig(owner=OWNER, room_id=CONTROL, secret=SECRET, approval_room=APPROVAL)
+    plugin.spaces_lock = asyncio.Lock()
+    plugin.linked = set()
     plugin.client = FakeClient()
     plugin.log = logging.getLogger("test")
     plugin.nonces = core.Nonces()
@@ -559,3 +594,184 @@ async def test_a_thread_reply_is_not_held_for_the_owner(setup):
     status, body, signed = await call(client, "/send", {"room": room, "text": "t", "thread": "$answer:example.org"})
     assert (status, signed) == (201, True) and body["thread"] == "$answer:example.org"
     assert plugin.client.sent[-1][2]["body"] == "t" and plugin.awaiting[room][1] == []
+
+
+# --- spaces -------------------------------------------------------------------------------------------------------
+
+
+def children(plugin, space):
+    """The rooms the (fake) server lists as live children of a space."""
+    return sorted(room for (sp, room) in plugin.client.api.children if sp == space)
+
+
+async def test_the_spaces_are_made_once_and_saved(setup):
+    plugin, client = setup
+    assert (await call(client, "/place", {"room": SESSION, "space": "dev"}))[:2] == (200, {"space": "dev"})
+    made = plugin.client.created
+    assert [m["name"] for m in made] == ["Agent sandbox", "Dev", "Orchestrator", "Rollenspiel"]
+    parent = plugin.config["spaces.parent"]
+    assert parent == "!space1:example.org" and plugin.config["spaces.rp"] == "!space4:example.org"
+    assert plugin.config.saves == 4                       # saved after every space, not once at the end
+    for m in made:
+        assert m["creation_content"] == {"type": "m.space"} and m["invitees"] == [OWNER] and m["is_direct"] is False
+        assert "preset" not in m                          # create_room's default: private, invite only
+        assert m["power_level_override"]["users"] == {BOT: 100, OWNER: 100}
+        assert not any(e["type"] == "m.room.encryption" for e in m["initial_state"])    # spaces carry no messages
+    assert made[0]["initial_state"] == []                 # the parent has no parent
+    assert made[1]["initial_state"] == [{"type": "m.space.parent", "state_key": parent,
+                                         "content": {"via": ["example.org"], "canonical": True}}]
+    # the parent holds the three sub-spaces, the control room and the approval room; Dev holds the placed session
+    assert children(plugin, parent) == sorted(["!space2:example.org", "!space3:example.org", "!space4:example.org",
+                                               CONTROL, APPROVAL])
+    assert children(plugin, "!space2:example.org") == [SESSION]
+    assert plugin.client.api.children[(parent, CONTROL)] == {"via": ["example.org"]}
+    # a second request, and a restart (a new plugin object over the same config and server), make nothing new
+    await call(client, "/place", {"room": SESSION, "space": "dev"})
+    assert plugin.client.spaces_made == 4
+    again = make_plugin()
+    again.client, again.config = plugin.client, plugin.config
+    await again._ensure_spaces()
+    assert plugin.client.spaces_made == 4 and plugin.config.saves == 4
+
+
+async def test_a_crash_between_two_spaces_does_not_make_a_second_copy(setup):
+    plugin, client = setup
+    real = plugin.client.create_room
+    calls = []
+
+    async def die_on_third(**kwargs):
+        calls.append(kwargs["name"])
+        if len(calls) == 3:
+            raise RuntimeError("homeserver gone")
+        return await real(**kwargs)
+
+    plugin.client.create_room = die_on_third
+    assert (await call(client, "/place", {"room": SESSION, "space": "dev"}))[0] == 502
+    assert plugin.config["spaces.parent"] and plugin.config["spaces.dev"] and not plugin.config["spaces.orchestrator"]
+    plugin.client.create_room = real
+    assert (await call(client, "/place", {"room": SESSION, "space": "dev"}))[0] == 200
+    assert plugin.client.spaces_made == 4                 # parent, dev, then orchestrator and rp: four in all, none twice
+
+
+async def test_room_without_space_is_unchanged(setup):
+    plugin, client = setup
+    assert await call(client, "/room", {"name": "local/x"}) == (201, {"room": "!new:example.org"}, True)
+    assert plugin.client.created[0]["initial_state"] == [sbx_chat.ENCRYPTION] and plugin.client.spaces_made == 0
+
+
+async def test_room_with_space_claims_the_parent_and_is_listed(setup):
+    plugin, client = setup
+    assert await call(client, "/room", {"name": "rp/x", "space": "rp"}) == (
+        201, {"room": "!new:example.org", "space": "rp"}, True)
+    rp = plugin.config["spaces.rp"]
+    session = [c for c in plugin.client.created if c["name"] == "rp/x"][0]
+    assert session["initial_state"][0]["type"] == "m.room.encryption"
+    assert session["initial_state"][1] == {"type": "m.space.parent", "state_key": rp,
+                                           "content": {"via": ["example.org"], "canonical": True}}
+    assert children(plugin, rp) == ["!new:example.org"]
+    assert (await call(client, "/send", {"room": "!new:example.org", "text": "x"}))[0] == 202   # still held for the join
+
+
+async def test_room_with_a_bad_space_is_refused(setup):
+    plugin, client = setup
+    for bad in ("other", "", 3, ["dev"], "parent"):
+        assert (await call(client, "/room", {"name": "x", "space": bad}))[0] == 400
+    assert plugin.client.created == []
+
+
+async def test_a_failing_space_never_fails_the_room(setup):
+    plugin, client = setup
+    real = plugin.client.create_room
+
+    async def no_spaces(**kwargs):
+        if kwargs.get("creation_content"):
+            raise RuntimeError("no")
+        return await real(**kwargs)
+
+    plugin.client.create_room = no_spaces
+    status, body, signed = await call(client, "/room", {"name": "local/x", "space": "dev"})
+    assert (status, body, signed) == (201, {"room": "!new:example.org", "space": None}, True)
+    assert [e["type"] for e in plugin.client.created[-1]["initial_state"]] == ["m.room.encryption"]
+    # and when only the listing fails: the room is made with its parent claim, the answer says it is not listed
+    plugin.client.create_room = real
+    send = plugin.client.send_state_event
+
+    async def refuse_children(room, event_type, content, state_key=""):
+        if str(event_type) == "m.space.child" and state_key == "!new:example.org":
+            raise RuntimeError("no power")
+        return await send(room, event_type, content, state_key)
+
+    plugin.client.send_state_event = refuse_children
+    assert (await call(client, "/room", {"name": "local/y", "space": "dev"}))[1]["space"] is None
+
+
+async def test_place_is_idempotent_and_sends_no_event_for_a_live_link(setup):
+    plugin, client = setup
+    assert (await call(client, "/place", {"room": SESSION, "space": "orchestrator"}))[1] == {"space": "orchestrator"}
+    sent = len(plugin.client.sent)
+    plugin.linked.clear()                                 # as after a restart: the state is read, not remembered
+    assert (await call(client, "/place", {"room": SESSION, "space": "orchestrator"}))[0] == 200
+    assert len(plugin.client.sent) == sent and children(plugin, plugin.config["spaces.orchestrator"]) == [SESSION]
+
+
+async def test_place_refusals(setup):
+    plugin, client = setup
+    assert (await call(client, "/place", {"room": FOREIGN, "space": "dev"}))[0] == 403
+    assert (await call(client, "/place", {"room": SESSION, "space": "nope"}))[0] == 400
+    assert (await call(client, "/place", {"room": SESSION}))[0] == 400
+    assert (await call(client, "/place", {"space": "dev"}))[0] == 400
+    assert plugin.client.created == []
+
+
+async def test_an_unset_approval_room_is_skipped(setup):
+    plugin, client = setup
+    plugin.config["approval_room"] = ""
+    await call(client, "/place", {"room": SESSION, "space": "dev"})
+    assert APPROVAL not in children(plugin, plugin.config["spaces.parent"])
+
+
+async def test_archive_takes_the_room_out_of_its_space(setup):
+    plugin, client = setup
+    await call(client, "/place", {"room": SESSION, "space": "dev"})
+    dev, rp = plugin.config["spaces.dev"], plugin.config["spaces.rp"]
+    assert children(plugin, dev) == [SESSION]
+    plugin.client.sent.clear(), plugin.client.state_keys.clear()
+    assert (await call(client, "/archive", {"room": SESSION, "name": "[ended] x"}))[:2] == (200, {"archived": True})
+    assert children(plugin, dev) == [] and plugin.client.left == [SESSION]
+    assert (dev, "m.space.child", {}) in plugin.client.sent
+    assert (SESSION, "m.space.parent", {}) in plugin.client.sent and dev in plugin.client.state_keys
+    assert not any(r == rp for r, _, _ in plugin.client.sent)     # the other sub-spaces were not touched
+    # a room that is in no space: archived as before, nothing sent into a space
+    plugin.client.sent.clear()
+    plugin.client.creators["!other:example.org"] = BOT
+    await call(client, "/archive", {"room": "!other:example.org", "name": "x"})
+    assert [t for _, t, _ in plugin.client.sent] == ["m.room.name"]
+
+
+async def test_archive_works_when_the_space_is_unreachable(setup):
+    plugin, client = setup
+    await call(client, "/place", {"room": SESSION, "space": "dev"})
+    send = plugin.client.send_state_event
+
+    async def fail_space(room, event_type, content, state_key=""):
+        if str(event_type) in ("m.space.child", "m.space.parent"):
+            raise RuntimeError("no")
+        return await send(room, event_type, content, state_key)
+
+    plugin.client.send_state_event = fail_space
+    assert (await call(client, "/archive", {"room": SESSION, "name": "[ended] x"}))[:2] == (200, {"archived": True})
+    assert plugin.client.left == [SESSION]
+
+
+async def test_the_control_room_and_the_approval_room_are_in_the_parent_space(setup):
+    plugin, client = setup
+    await plugin._ensure_spaces()
+    parent = plugin.config["spaces.parent"]
+    assert {CONTROL, APPROVAL} <= set(children(plugin, parent))
+
+
+async def test_two_requests_at_once_make_the_spaces_once(setup):
+    plugin, client = setup
+    answers = await asyncio.gather(*[call(client, "/place", {"room": SESSION, "space": key})
+                                     for key in ("dev", "orchestrator", "rp", "dev")])
+    assert [a[0] for a in answers] == [200] * 4 and plugin.client.spaces_made == 4
