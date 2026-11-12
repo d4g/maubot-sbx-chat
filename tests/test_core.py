@@ -315,6 +315,21 @@ def test_parse_redact():
     assert core.parse_redact({"room": "!a:b", "event": "$" + "x" * 200})[1] == "$" + "x" * 200
 
 
+def test_parse_react():
+    assert core.parse_react({"room": "!a:b", "event": "$e:x", "key": "🔁"}) == ("!a:b", "$e:x", "🔁")
+    # an emoji made of several code points (variation selector, zero-width joiner) is one key
+    assert core.parse_react({"room": "!a:b", "event": "$e", "key": "❤️"})[2] == "❤️"
+    assert core.parse_react({"room": "!a:b", "event": "$e", "key": "x" * 32})[2] == "x" * 32
+    for bad in ({"room": "!a:b", "event": "$e"}, {"room": "!a:b", "event": "$e", "key": ""},
+                {"room": "!a:b", "event": "$e", "key": "x" * 33}, {"room": "!a:b", "event": "$e", "key": 5},
+                {"room": "!a:b", "event": "$e", "key": "a\nb"}, {"room": "!a:b", "event": "$e", "key": "\x00"},
+                {"room": "!a:b", "event": "$e", "key": "\x7f"}, {"room": "!a:b", "key": "x"},
+                {"room": "!a:b", "event": "e", "key": "x"}, {"event": "$e", "key": "x"}, []):
+        with pytest.raises(core.Refused) as error:
+            core.parse_react(bad)
+        assert error.value.status == 400, bad
+
+
 def test_thread_of():
     thread = {"rel_type": "m.thread", "event_id": "$root", "is_falling_back": True, "m.in_reply_to": {"event_id": "$r"}}
     assert core.thread_of({"m.relates_to": thread}) == "$root"

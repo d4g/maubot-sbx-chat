@@ -23,6 +23,7 @@ import html
 import re
 import secrets
 import time
+import unicodedata
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 
@@ -197,6 +198,22 @@ def parse_redact(data) -> tuple[str, str]:
     """(room, the event to redact): an event ID is a string that starts with `$` (EVENT: at most 201 characters, no whitespace)."""
     data = _object(data)
     return _room(data), _event(data)
+
+
+REACT_KEY_MAX = 32
+
+
+def parse_react(data) -> tuple[str, str, str]:
+    """(room, the event to react to, the reaction key). The key is what the reaction shows, an emoji as a rule: 1 to
+    REACT_KEY_MAX characters (not bytes), none of them a control character (Unicode category Cc, or a lone surrogate, Cs; format
+    characters such as the zero-width joiner and variation selectors stay allowed, because emoji are made of them)."""
+    data = _object(data)
+    key = data.get("key")
+    if not isinstance(key, str) or not 1 <= len(key) <= REACT_KEY_MAX:
+        raise Refused(400, "bad key")
+    if any(unicodedata.category(c) in ("Cc", "Cs") for c in key):
+        raise Refused(400, "bad key")
+    return _room(data), _event(data), key
 
 
 def parse_markdown(data) -> bool:

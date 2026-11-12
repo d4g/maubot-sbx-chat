@@ -10,7 +10,7 @@ It holds no session state and runs no model or agent. The program behind it is `
 ADR 0027 ("Matrix chat front end for the sessions of the local boxes"). It reuses the pattern of
 [maubot-sbx-approval](https://github.com/d4g/maubot-sbx-approval) (ADR 0024).
 
-**Status:** version 0.6.0 (formatted messages, threads in events, redaction), tested off-line (logic, and the HTTP endpoints of the real plugin class against maubot 0.6.0 /
+**Status:** version 0.7.0 (formatted messages, threads in events, redaction, reactions), tested off-line (logic, and the HTTP endpoints of the real plugin class against maubot 0.6.0 /
 mautrix 0.21.1 with a fake Matrix client, routed as maubot routes them). Not yet run against a real homeserver.
 
 ## Design in brief
@@ -55,6 +55,7 @@ signed, stale or replayed request gets `401` without a signature, and `503` whil
 | `POST /send` | `{"room", "text", "thread"?, "markdown"?}` — text ≤ 30 KiB UTF-8, plain unless `markdown` is `true` (then also sent as HTML, see "Formatted messages"; a non-boolean is `400`); `thread`: the event ID of a message this account sent, then the text is a reply in that message's thread (`m.thread`), as maubot-sbx-approval does for its detail | `201 {"event", "thread"?, "markdown"?}` (`thread` and `markdown: true` repeated when applied, so a caller can tell that this version knew the field); `202 {"event": null, "held": true, …}` while the owner has not joined a new room (the held text is formatted too when sent); `403` not a room of this plugin; `413`; `502` |
 | `POST /edit` | `{"room", "event", "text", "markdown"?}` — replaces an earlier message of this account (`m.replace`); `markdown` as in `/send` | `200 {"event", "markdown"?}` (`markdown: true` repeated when applied) |
 | `POST /redact` | `{"room", "event"}` — `event` is an event ID: a string starting with `$`, no whitespace, at most 201 characters (`400` otherwise) | `200 {"redacted": true}` — the event is redacted (its content removed, irreversibly); `403` for the control room and for a room this plugin did not make; `502` when the homeserver refuses (for example the bot lacks the power to redact that event) |
+| `POST /react` | `{"room", "event", "key"}` — `event` as for `/redact`; `key` is what the reaction shows (an emoji, say `🔁`): 1 to 32 characters, none a control character (`400` otherwise) | `200 {"event"}` — an `m.reaction` of the bot with `m.relates_to` `rel_type` `m.annotation` was sent; `403` for the control room and for a room this plugin did not make; `502` when the homeserver refuses |
 | `POST /room` | `{"name", "space"?}` — name ≤ 80 characters; `space`: `dev`, `orchestrator` or `rp` (else `400`) | `201 {"room", "space"?}` — private, encrypted from creation, the owner invited. With `space`, the room claims that sub-space (`m.space.parent`) and is listed in it (`m.space.child`); `space` is repeated, `null` if the listing failed (the room is made anyway), so a caller can tell that this version knew the field |
 | `POST /spaces` | `{}` | `200 {"spaces": {"parent", "dev", "orchestrator", "rp"}}` (room IDs) — missing spaces made, the control room, the `approval_room` and the sub-spaces linked into the parent; `502` |
 | `POST /place` | `{"room", "space"}` — the control room or a room this plugin made | `200 {"space"}` — listed in that sub-space unless it is already (no event is sent then); `400` bad space, `403` foreign room, `502` |
@@ -91,6 +92,12 @@ tags. No links, no other tags, no attributes except that class; every tag used i
 for one event. Limits: only rooms this plugin made (the same check as every other room endpoint) and never the control room.
 Whether the homeserver accepts it is the homeserver's rule (the sender may redact their own events, others need the room's
 redact power level); a refusal comes back as the signed `502`. Not checked against a real server.
+
+**Reactions.** `/react` sends an `m.reaction` event with `m.relates_to` = `{rel_type: m.annotation, event_id, key}` through the
+bot's client, so it is encrypted like every other event of an encrypted session room. Whether the owner's Matrix client shows an
+encrypted reaction is **not verified** (clients themselves send reactions unencrypted); not checked against a real server. The
+caller is `sbx-chat` (the `!fallback` replacement puts `🔁` on the new answer); a plugin older than 0.7.0 lacks the route, which
+the caller notes once and goes on without the reaction.
 
 **Events and restarts.** The caller confirms by sending the last sequence number it processed, so a lost answer only
 repeats messages. Every start of the plugin makes a new random `epoch`; a caller that sends another epoch gets all queued
@@ -150,7 +157,7 @@ pin is changed on the host. `pname` and `version` must equal `id` and `version` 
 ```nix
 sbxChat = config.services.maubot.package.plugins.buildMaubotPlugin {
   pname = "rocks.dag.sbx-chat";
-  version = "0.6.0";
+  version = "0.7.0";
   src = pkgs.fetchFromGitHub {
     owner = "d4g";
     repo = "maubot-sbx-chat";

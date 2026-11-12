@@ -236,6 +236,26 @@ class SbxChat(Plugin):
             self.log.exception("redact failed")
             return self._reply(await self._nonce_of(request), 502, {"error": "could not redact"})
 
+    @web.post("/react")
+    async def react(self, request: Request) -> Response:
+        """A reaction (`m.reaction`, `m.annotation`) of the bot to one event of a session room, for example the mark the caller
+        puts on an answer it replaced. Only in rooms this plugin made, and never in the control room (nothing there is answered
+        with a mark). Whether the event exists is the homeserver's business."""
+        try:
+            nonce, data = await self._read(request)
+            room, event_id, key = core.parse_react(data)
+            if room == self.config["room_id"]:
+                raise core.Refused(403, "no reactions in the control room")
+            await self._need_room(room)
+            reaction_id = await self.client.send_message_event(
+                room, EventType.REACTION, {"m.relates_to": {"rel_type": "m.annotation", "event_id": event_id, "key": key}})
+            return self._reply(nonce, 200, {"event": reaction_id})
+        except core.Refused as error:
+            return self._refused(error)
+        except Exception:
+            self.log.exception("react failed")
+            return self._reply(await self._nonce_of(request), 502, {"error": "could not react"})
+
     @web.post("/room")
     async def room(self, request: Request) -> Response:
         """An end-to-end encrypted private room with the owner invited. Encryption is part of the creation, so no

@@ -942,6 +942,38 @@ async def test_redact_refusals(setup):
     assert plugin.client.redacted == []
 
 
+async def test_react(setup):
+    plugin, client = setup
+    status, body, signed = await call(client, "/react", {"room": SESSION, "event": "$ev1:example.org", "key": "🔁"})
+    assert (status, signed) == (200, True)
+    assert plugin.client.sent[-1] == (SESSION, "m.reaction", {"m.relates_to": {
+        "rel_type": "m.annotation", "event_id": "$ev1:example.org", "key": "🔁"}})
+    assert body == {"event": f"$ev{len(plugin.client.sent)}"}
+
+
+async def test_react_refusals(setup):
+    plugin, client = setup
+    assert (await call(client, "/react", {"room": CONTROL, "event": "$e", "key": "x"}))[0] == 403
+    assert (await call(client, "/react", {"room": FOREIGN, "event": "$e", "key": "x"}))[0] == 403
+    for bad in ({"room": SESSION, "event": "$e"}, {"room": SESSION, "event": "$e", "key": ""},
+                {"room": SESSION, "event": "$e", "key": "x" * 33}, {"room": SESSION, "event": "$e", "key": "a\tb"},
+                {"room": SESSION, "event": "e", "key": "x"}, {"room": SESSION, "key": "x"}):
+        assert (await call(client, "/react", bad))[0] == 400, bad
+    assert (await call(client, "/react", {"room": SESSION, "event": "$e", "key": "x"}, secret="x" * 40))[0] == 401
+    assert not [s for s in plugin.client.sent if s[1] == "m.reaction"]
+
+
+async def test_react_failure_is_a_signed_502(setup):
+    plugin, client = setup
+
+    async def fail(room, event_type, content):
+        raise RuntimeError("no power")
+
+    plugin.client.send_message_event = fail
+    status, body, signed = await call(client, "/react", {"room": SESSION, "event": "$e", "key": "x"})
+    assert (status, signed, body) == (502, True, {"error": "could not react"})
+
+
 async def test_redact_failure_is_a_signed_502(setup):
     plugin, client = setup
 
