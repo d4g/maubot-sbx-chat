@@ -220,6 +220,11 @@ def test_markdown_html(text, expected):
     assert core.markdown_html(text) == expected
 
 
+def test_markdown_thousands_of_strong_spans_do_not_hit_the_recursion_limit():
+    text = "**a** " * 5000                    # 30 KiB, the largest text /send takes
+    assert core.markdown_html(text).count("<strong>a</strong>") == 5000
+
+
 def test_markdown_overlapping_markers_never_misnest():
     assert core.markdown_html("**a *b** c*") == "<strong>a *b</strong> c*"
     assert core.markdown_html("*a **b* c**") == "*a <strong>b* c</strong>"

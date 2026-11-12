@@ -389,11 +389,14 @@ def _em(text: str) -> str:
 def _emphasis(text: str) -> str:
     """**strong** and *em* / _em_ in text that is already escaped and holds no code. Strong is cut out first and its inside
     and the rest are handled on their own, so spans can never overlap into misnested tags: `**a *b** c*` leaves the single
-    star literal. An unclosed marker has no match and stays as text."""
-    found = STRONG.search(text)
-    if not found:
-        return _em(text)
-    return _em(text[:found.start()]) + "<strong>" + _em(found.group(1)) + "</strong>" + _emphasis(text[found.end():])
+    star literal. An unclosed marker has no match and stays as text. A loop, not recursion: a 30 KiB text can hold thousands
+    of strong spans, more than Python's recursion limit."""
+    out, last = [], 0
+    for found in STRONG.finditer(text):
+        out.append(_em(text[last:found.start()]) + "<strong>" + _em(found.group(1)) + "</strong>")
+        last = found.end()
+    out.append(_em(text[last:]))
+    return "".join(out)
 
 
 def _prose(text: str) -> str:
