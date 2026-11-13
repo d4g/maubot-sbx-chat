@@ -162,6 +162,7 @@ def make_plugin():
     plugin.config = FakeConfig(owner=OWNER, room_id=CONTROL, secret=SECRET, approval_room=APPROVAL)
     plugin.spaces_lock = asyncio.Lock()
     plugin.linked = set()
+    plugin.owner_joined = {}
     plugin.client = FakeClient()
     plugin.log = logging.getLogger("test")
     plugin.nonces = core.Nonces()
@@ -238,9 +239,27 @@ async def test_owner_message_is_queued(setup):
     assert [e["text"] for e in again[1]["events"]] == ["in control"]
 
 
-def member(room, who, membership, sender=None):
-    return types.SimpleNamespace(room_id=room, state_key=who, sender=sender or who,
+class Unsigned(types.SimpleNamespace):
+    """Stands in for mautrix's StateUnsigned: attributes plus get() for the keys mautrix adds (mautrix_prev_membership)."""
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+
+def member(room, who, membership, sender=None, prev=None, cached=None, event_id=None):
+    """A member event. prev: the membership in unsigned.prev_content (what the server sends), cached: the one in
+    mautrix's cache (unsigned.mautrix_prev_membership); None leaves it out. event_id: a fresh one unless given (a copy
+    of an event the server sends again has the same ID)."""
+    unsigned = Unsigned(prev_content=types.SimpleNamespace(membership=prev) if prev else None)
+    if cached:
+        unsigned.mautrix_prev_membership = types.SimpleNamespace(membership=cached)
+    member.count += 1
+    return types.SimpleNamespace(room_id=room, state_key=who, sender=sender or who, unsigned=unsigned,
+                                 event_id=event_id or f"$member{member.count}",
                                  content=types.SimpleNamespace(membership=membership))
+
+
+member.count = 0
 
 
 async def test_owner_join_drops_the_group_session(setup):
@@ -248,6 +267,33 @@ async def test_owner_join_drops_the_group_session(setup):
     plugin, _ = setup
     await plugin.on_member(member(SESSION, OWNER, Membership.JOIN))
     assert plugin.client.crypto.crypto_store.dropped == [SESSION]
+
+
+async def test_join_after_join_keeps_the_group_session(setup):
+    """A join event of the owner who had already joined (a profile change, or the copy of the member event the server
+    sends along with the owner's messages) must not drop the session: before 0.8.1 every answer went out under a new
+    session and Element X showed "Waiting for this message" (2026-11-13)."""
+    plugin, _ = setup
+    store = plugin.client.crypto.crypto_store
+    await plugin.on_member(member(SESSION, OWNER, Membership.JOIN, prev=Membership.JOIN))          # server says join -> join
+    await plugin.on_member(member(SESSION, OWNER, Membership.JOIN, cached=Membership.JOIN))        # mautrix's cache says so
+    assert store.dropped == []
+    await plugin.on_member(member(SESSION, OWNER, Membership.JOIN, prev=Membership.INVITE, event_id="$join"))  # real
+    assert store.dropped == [SESSION]
+    for _ in range(3):      # the server sends the same join event again along with messages: same ID, same prev_content
+        await plugin.on_member(member(SESSION, OWNER, Membership.JOIN, prev=Membership.INVITE, event_id="$join"))
+    await plugin.on_member(member(SESSION, OWNER, Membership.JOIN))          # a later join event without a previous state
+    await plugin.on_member(member(SESSION, OWNER, Membership.JOIN, prev=Membership.INVITE, cached=Membership.JOIN))
+    assert store.dropped == [SESSION]
+
+
+async def test_a_rejoin_after_leaving_drops_the_group_session_again(setup):
+    plugin, _ = setup
+    store = plugin.client.crypto.crypto_store
+    await plugin.on_member(member(SESSION, OWNER, Membership.JOIN))
+    await plugin.on_member(member(SESSION, OWNER, Membership.LEAVE))
+    await plugin.on_member(member(SESSION, OWNER, Membership.JOIN, prev=Membership.LEAVE))
+    assert store.dropped == [SESSION, SESSION]
 
 
 async def test_other_membership_changes_keep_the_group_session(setup):

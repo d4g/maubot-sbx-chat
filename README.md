@@ -10,7 +10,7 @@ It holds no session state and runs no model or agent. The program behind it is `
 ADR 0027 ("Matrix chat front end for the sessions of the local boxes"). It reuses the pattern of
 [maubot-sbx-approval](https://github.com/d4g/maubot-sbx-approval) (ADR 0024).
 
-**Status:** version 0.8.0 (formatted messages, threads in events, redaction, reactions, notices, typing), tested off-line (logic, and the HTTP endpoints of the real plugin class against maubot 0.6.0 /
+**Status:** version 0.8.1 (formatted messages, threads in events, redaction, reactions, notices, typing; 0.8.1: one Megolm session per room again, see "A new key when the owner joins"), tested off-line (logic, and the HTTP endpoints of the real plugin class against maubot 0.6.0 /
 mautrix 0.21.1 with a fake Matrix client, routed as maubot routes them). Not yet run against a real homeserver.
 
 ## Design in brief
@@ -25,7 +25,11 @@ mautrix 0.21.1 with a fake Matrix client, routed as maubot routes them). Not yet
 - **A new key when the owner joins.** The room is created with the owner only invited, and mautrix shares the first Megolm
   session with the joined members, which is the bot alone, and keeps it when the invitation becomes a join. So the plugin
   drops the room's outbound session when the owner joins (`on_member`), and the next message gets a session that includes
-  the owner. What the bot sent before the join stays unreadable for the owner.
+  the owner. What the bot sent before the join stays unreadable for the owner. Only a real join counts (0.8.1): a join
+  after a join (a profile change) and copies of the same join event, which the homeserver sends along with the owner's
+  messages, leave the session alone. Up to 0.8.0 each of them dropped it, so every answer went out under a brand-new
+  session whose key arrived milliseconds before it, and Element X showed "Waiting for this message" until the room was
+  opened again. The plugin logs `owner joined <room>: group session dropped` when it drops one.
 - **The caller always initiates.** The program on VM 130 polls `POST /events` and posts to the other endpoints; no port
   opens there and no Matrix key is stored there.
 - **Signed with HMAC**, requests and responses, over a shared secret with timestamp and nonce (the scheme of
@@ -169,7 +173,7 @@ pin is changed on the host. `pname` and `version` must equal `id` and `version` 
 ```nix
 sbxChat = config.services.maubot.package.plugins.buildMaubotPlugin {
   pname = "rocks.dag.sbx-chat";
-  version = "0.8.0";
+  version = "0.8.1";
   src = pkgs.fetchFromGitHub {
     owner = "d4g";
     repo = "maubot-sbx-chat";

@@ -28,6 +28,26 @@ HOLD_MAX = 24 * 3600
 ENCRYPTION = {"type": "m.room.encryption", "state_key": "", "content": {"algorithm": "m.megolm.v1.aes-sha2"}}
 
 
+def _server_prev_membership(evt) -> Membership | None:
+    """The membership before this member event as the server sent it (unsigned.prev_content), or None. Not from
+    StateEvent.prev_content: without a previous state that property returns a default content whose membership is
+    "leave" (mautrix/types/event/state.py). A lazy-loaded copy of the owner's original join carries that join's own
+    previous state ("invite"), so this alone cannot tell a copy from a new join; see on_member."""
+    unsigned = getattr(evt, "unsigned", None)
+    return getattr(getattr(unsigned, "prev_content", None), "membership", None) or None
+
+
+def _cached_membership(evt) -> Membership | None:
+    """The membership mautrix had cached for this user before the event (unsigned["mautrix_prev_membership"], a Member),
+    or None. mautrix's own handler uses it to skip duplicate member events."""
+    unsigned = getattr(evt, "unsigned", None)
+    try:
+        cached = unsigned.get("mautrix_prev_membership") if unsigned is not None else None
+    except (AttributeError, TypeError):
+        cached = None
+    return getattr(cached, "membership", None)
+
+
 class Config(BaseProxyConfig):
     def do_update(self, helper: ConfigUpdateHelper) -> None:
         for key in ("owner", "room_id", "secret", "approval_room", "spaces.parent", "spaces.dev", "spaces.orchestrator",
@@ -51,6 +71,11 @@ class SbxChat(Plugin):
     # (space, room) pairs known to be linked by an m.space.child, so that the start-up pass of the caller (one /place per
     # session) does not read the same state again with every request. Not persistent: after a restart each is read once.
     linked: set[tuple[str, str]]
+    # Rooms of this plugin where the owner's join was already handled (the group session dropped once): room ID -> the
+    # event ID of that join. A later join event of the owner there is a copy of the same event or a profile change, not a
+    # new join. Not persistent: after a restart the first owner join event per room drops the session once more (one
+    # extra rotation, harmless).
+    owner_joined: dict[str, str]
 
     @classmethod
     def get_config_class(cls) -> type[BaseProxyConfig]:
@@ -66,6 +91,7 @@ class SbxChat(Plugin):
         self.awaiting = {}
         self.spaces_lock = asyncio.Lock()
         self.linked = set()
+        self.owner_joined = {}
         if self._secret() is None:
             self.log.warning("secret missing or shorter than %d characters: every request is refused", core.SECRET_MIN)
 
@@ -657,14 +683,33 @@ class SbxChat(Plugin):
         into a join (mautrix/crypto/machine.py, `ignored_changes`), so every later message would stay unreadable for
         the owner ("Unable to decrypt message"; seen 2026-11-09). Dropping the outbound session makes the next
         message create one that is shared with everybody who has joined by then. What was sent before the join stays
-        unreadable: the owner's device never got that key."""
-        if evt.state_key != self.config["owner"] or evt.content.membership != Membership.JOIN:
+        unreadable: the owner's device never got that key.
+
+        Only a real join counts, a change from not joined to joined. Before 0.8.1 every join event of the owner dropped
+        the session, also a join after a join: the homeserver sends the sender's member event along with the messages
+        (lazy-loaded members) and with every profile change. Each answer of the bot then went out under a brand-new
+        session whose key was sent milliseconds before it, and Element X showed "Waiting for this message" until the
+        room or thread was opened again (seen 2026-11-13). mautrix skips join after join in its own handler too
+        (mautrix/crypto/machine.py, handle_member_event)."""
+        if evt.state_key != self.config["owner"]:
+            return
+        if evt.content.membership != Membership.JOIN:
+            self.owner_joined.pop(evt.room_id, None)     # left, kicked or banned: a later join is a new one again
             return
         if evt.sender != evt.state_key or not await self._is_ours(evt.room_id):
             return
+        event_id = getattr(evt, "event_id", None)
+        handled = self.owner_joined.get(evt.room_id)
+        if _cached_membership(evt) == Membership.JOIN or (handled is not None and handled == event_id):
+            return          # a copy of a join already seen: mautrix's cache knows it, or it is the very event handled
+        prev = _server_prev_membership(evt)
+        if prev == Membership.JOIN or (handled is not None and prev is None):
+            return          # a profile change (join -> join), or a later join event that does not say what came before
+        self.owner_joined[evt.room_id] = event_id
         if self.client.crypto:
             try:
                 await self.client.crypto.crypto_store.remove_outbound_group_session(evt.room_id)
+                self.log.info("owner joined %s: group session dropped, the next message starts a new one", evt.room_id)
             except Exception:
                 self.log.exception("could not drop the group session of %s", evt.room_id)
         # Only now, with the new session, can the owner read the notices the daemon sent before the join.
