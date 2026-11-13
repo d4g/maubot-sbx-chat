@@ -76,6 +76,7 @@ class FakeClient:
     def __init__(self):
         self.sent, self.created, self.left, self.state_keys, self.uploads = [], [], [], [], []
         self.redacted = []
+        self.typing = []
         self.spaces_made = 0
         self.api, self.crypto = FakeApi(), FakeCrypto()
         self.files = {}
@@ -131,6 +132,10 @@ class FakeClient:
 
     async def leave_room(self, room):
         self.left.append(room)
+
+    async def set_typing(self, room_id, timeout=0):
+        """mautrix's signature: set_typing(room_id, timeout=0); 0 or less means stopped typing."""
+        self.typing.append((room_id, timeout))
 
 
 class FakeConfig:
@@ -983,3 +988,42 @@ async def test_redact_failure_is_a_signed_502(setup):
     plugin.client.redact = fail
     status, body, signed = await call(client, "/redact", {"room": SESSION, "event": "$e"})
     assert (status, signed, body) == (502, True, {"error": "could not redact"})
+
+
+async def test_send_notice(setup):
+    plugin, client = setup
+    assert await call(client, "/send", {"room": SESSION, "text": "switching", "notice": True}) ==         (201, {"event": "$ev1", "notice": True}, True)
+    assert plugin.client.sent[0][2] == {"msgtype": "m.notice", "body": "switching"}
+    status, body, _ = await call(client, "/send", {"room": SESSION, "text": "x", "notice": "yes"})
+    assert (status, body["error"]) == (400, "bad notice")
+    # A notice in a thread, formatted.
+    await call(client, "/send", {"room": SESSION, "text": "**d**", "notice": True, "markdown": True, "thread": "$ev1"})
+    content = plugin.client.sent[1][2]
+    assert content["msgtype"] == "m.notice" and content["formatted_body"] == "<strong>d</strong>"
+    assert content["m.relates_to"]["event_id"] == "$ev1"
+
+
+async def test_held_notice_stays_a_notice(setup):
+    plugin, client = setup
+    room = "!new:example.org"
+    plugin.client.creators[room] = BOT
+    assert (await call(client, "/room", {"name": "local/x"}))[0] == 201
+    plugin.client.sent.clear()
+    assert (await call(client, "/send", {"room": room, "text": "n", "notice": True}))[:2] ==         (202, {"event": None, "held": True, "notice": True})
+    await plugin.on_member(member(room, OWNER, Membership.JOIN))
+    assert plugin.client.sent[-1][2] == {"msgtype": "m.notice", "body": "n"}
+
+
+async def test_typing(setup):
+    plugin, client = setup
+    assert await call(client, "/typing", {"room": SESSION, "typing": True, "timeout": 30000}) == (200, {"typing": True}, True)
+    assert await call(client, "/typing", {"room": SESSION, "typing": False}) == (200, {"typing": False}, True)
+    assert plugin.client.typing == [(SESSION, 30000), (SESSION, 0)]
+    for bad, error in (({"typing": "on"}, "bad typing"), ({"typing": True}, "bad timeout"),
+                       ({"typing": True, "timeout": 0}, "bad timeout"), ({"typing": True, "timeout": 120001}, "bad timeout"),
+                       ({"typing": True, "timeout": True}, "bad timeout")):
+        status, body, _ = await call(client, "/typing", {"room": SESSION, **bad})
+        assert (status, body["error"]) == (400, error)
+    status, body, _ = await call(client, "/typing", {"room": FOREIGN, "typing": True, "timeout": 1000})
+    assert (status, body["error"]) == (403, "not a room of this plugin")
+    assert len(plugin.client.typing) == 2

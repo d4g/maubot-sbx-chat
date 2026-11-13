@@ -1,6 +1,6 @@
 maubot: 0.1.0
 id: rocks.dag.sbx-chat
-version: 0.7.0
+version: 0.8.0
 license: Unlicense
 modules:
 - sbx_chat

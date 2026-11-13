@@ -10,7 +10,7 @@ It holds no session state and runs no model or agent. The program behind it is `
 ADR 0027 ("Matrix chat front end for the sessions of the local boxes"). It reuses the pattern of
 [maubot-sbx-approval](https://github.com/d4g/maubot-sbx-approval) (ADR 0024).
 
-**Status:** version 0.7.0 (formatted messages, threads in events, redaction, reactions), tested off-line (logic, and the HTTP endpoints of the real plugin class against maubot 0.6.0 /
+**Status:** version 0.8.0 (formatted messages, threads in events, redaction, reactions, notices, typing), tested off-line (logic, and the HTTP endpoints of the real plugin class against maubot 0.6.0 /
 mautrix 0.21.1 with a fake Matrix client, routed as maubot routes them). Not yet run against a real homeserver.
 
 ## Design in brief
@@ -52,10 +52,11 @@ signed, stale or replayed request gets `401` without a signature, and `503` whil
 |---|---|---|
 | `POST /events` | `{"epoch"?, "after"?, "wait"?}` — the epoch the caller last saw, the last sequence number it processed, seconds to wait for a message (0 to 30) | `200 {"epoch", "events": [{"seq", "room", "text", "event", "image"?, "thread"?}, …]}` — everything after `after`; `text` is the caption of an image, possibly empty; `thread` is the event ID of the thread root when the owner wrote the message inside a Matrix thread (see below), absent otherwise; waits until there is something or `wait` ran out |
 | `POST /media` | `{"id"}` — the `image.id` of an event | `200 {"mime", "data"}` (base64), **once**: the image is removed when served; signed `404` if unknown (served already, dropped, or maubot restarted) |
-| `POST /send` | `{"room", "text", "thread"?, "markdown"?}` — text ≤ 30 KiB UTF-8, plain unless `markdown` is `true` (then also sent as HTML, see "Formatted messages"; a non-boolean is `400`); `thread`: the event ID of a message this account sent, then the text is a reply in that message's thread (`m.thread`), as maubot-sbx-approval does for its detail | `201 {"event", "thread"?, "markdown"?}` (`thread` and `markdown: true` repeated when applied, so a caller can tell that this version knew the field); `202 {"event": null, "held": true, …}` while the owner has not joined a new room (the held text is formatted too when sent); `403` not a room of this plugin; `413`; `502` |
+| `POST /send` | `{"room", "text", "thread"?, "markdown"?, "notice"?}` — text ≤ 30 KiB UTF-8, plain unless `markdown` is `true` (then also sent as HTML, see "Formatted messages"; a non-boolean is `400`); `notice: true` sends an `m.notice` instead of an `m.text` (a non-boolean is `400`); `thread`: the event ID of a message this account sent, then the text is a reply in that message's thread (`m.thread`), as maubot-sbx-approval does for its detail | `201 {"event", "thread"?, "markdown"?, "notice"?}` (`thread`, `markdown: true` and `notice: true` repeated when applied, so a caller can tell that this version knew the field); `202 {"event": null, "held": true, …}` while the owner has not joined a new room (the held text is formatted too when sent); `403` not a room of this plugin; `413`; `502` |
 | `POST /edit` | `{"room", "event", "text", "markdown"?}` — replaces an earlier message of this account (`m.replace`); `markdown` as in `/send` | `200 {"event", "markdown"?}` (`markdown: true` repeated when applied) |
 | `POST /redact` | `{"room", "event"}` — `event` is an event ID: a string starting with `$`, no whitespace, at most 201 characters (`400` otherwise) | `200 {"redacted": true}` — the event is redacted (its content removed, irreversibly); `403` for the control room and for a room this plugin did not make; `502` when the homeserver refuses (for example the bot lacks the power to redact that event) |
 | `POST /react` | `{"room", "event", "key"}` — `event` as for `/redact`; `key` is what the reaction shows (an emoji, say `🔁`): 1 to 32 characters, none a control character (`400` otherwise) | `200 {"event"}` — an `m.reaction` of the bot with `m.relates_to` `rel_type` `m.annotation` was sent; `403` for the control room and for a room this plugin did not make; `502` when the homeserver refuses |
+| `POST /typing` | `{"room", "typing", "timeout"?}` — `typing` a JSON boolean; with `true`, `timeout` in milliseconds, 1 to 120000 (`400` otherwise) | `200 {"typing"}` — the bot shows as typing for `timeout` ms, or stops at once with `false`; `403` for a room this plugin did not make; `502` when the homeserver refuses |
 | `POST /room` | `{"name", "space"?}` — name ≤ 80 characters; `space`: `dev`, `orchestrator` or `rp` (else `400`) | `201 {"room", "space"?}` — private, encrypted from creation, the owner invited. With `space`, the room claims that sub-space (`m.space.parent`) and is listed in it (`m.space.child`); `space` is repeated, `null` if the listing failed (the room is made anyway), so a caller can tell that this version knew the field |
 | `POST /spaces` | `{}` | `200 {"spaces": {"parent", "dev", "orchestrator", "rp"}}` (room IDs) — missing spaces made, the control room, the `approval_room` and the sub-spaces linked into the parent; `502` |
 | `POST /place` | `{"room", "space"}` — the control room or a room this plugin made | `200 {"space"}` — listed in that sub-space unless it is already (no event is sent then); `400` bad space, `403` foreign room, `502` |
@@ -98,6 +99,17 @@ bot's client, so it is encrypted like every other event of an encrypted session 
 encrypted reaction is **not verified** (clients themselves send reactions unencrypted); not checked against a real server. The
 caller is `sbx-chat` (the `!fallback` replacement puts `🔁` on the new answer); a plugin older than 0.7.0 lacks the route, which
 the caller notes once and goes on without the reaction.
+
+**Notices.** `notice: true` on `/send` sends `msgtype` `m.notice`: clients show it dimmed, and the default push rule
+`.m.rule.suppress_notices` never notifies for it. A held notice (owner not joined yet) stays a notice when it is sent. The
+caller is `sbx-chat`, for the model switch and the end line of a turn; a plugin older than 0.8.0 ignores the field and
+does not repeat it, so the text arrived as a plain message.
+
+**Typing.** `/typing` sets the bot's typing notification (`PUT /_matrix/client/v3/rooms/{roomId}/typing/{userId}`, mautrix
+`client.set_typing(room, timeout)`, 0 = stopped). Per the spec (v1.12, "Typing Notifications") it is ephemeral: no
+timeline event, nothing to edit or redact, it ends by itself when the timeout runs out, and it is scoped to the room (there
+is no thread field). The spec recommends refreshing it every 20 to 30 seconds; `sbx-chat` shows it while a turn runs
+instead of an edited status message (Element X showed those edits late). How clients show a bot's typing is not checked.
 
 **Events and restarts.** The caller confirms by sending the last sequence number it processed, so a lost answer only
 repeats messages. Every start of the plugin makes a new random `epoch`; a caller that sends another epoch gets all queued
@@ -157,7 +169,7 @@ pin is changed on the host. `pname` and `version` must equal `id` and `version` 
 ```nix
 sbxChat = config.services.maubot.package.plugins.buildMaubotPlugin {
   pname = "rocks.dag.sbx-chat";
-  version = "0.7.0";
+  version = "0.8.0";
   src = pkgs.fetchFromGitHub {
     owner = "d4g";
     repo = "maubot-sbx-chat";

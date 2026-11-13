@@ -225,6 +225,34 @@ def parse_markdown(data) -> bool:
     return value
 
 
+def parse_notice(data) -> bool:
+    """`notice` of /send: absent means False (an m.text message); true sends an m.notice, which clients show dimmed and which
+    never notifies (push rule .m.rule.suppress_notices). Anything but a JSON boolean is refused, as for `markdown`."""
+    value = _object(data).get("notice", False)
+    if not isinstance(value, bool):
+        raise Refused(400, "bad notice")
+    return value
+
+
+TYPING_MAX_MS = 120_000
+
+
+def parse_typing(data) -> tuple[str, int]:
+    """(room, timeout in milliseconds) of /typing; 0 means "stopped typing". `typing` must be a JSON boolean; with true,
+    `timeout` is a whole number of milliseconds from 1 to TYPING_MAX_MS (the spec recommends that the client refreshes the
+    state every 20 to 30 seconds, so a long timeout is never needed); with false it is ignored."""
+    data = _object(data)
+    typing = data.get("typing")
+    if not isinstance(typing, bool):
+        raise Refused(400, "bad typing")
+    if not typing:
+        return _room(data), 0
+    timeout = data.get("timeout")
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= TYPING_MAX_MS:
+        raise Refused(400, "bad timeout")
+    return _room(data), timeout
+
+
 def parse_room(data) -> str:
     return _name(_object(data))
 
@@ -458,10 +486,10 @@ def markdown_html(text: str) -> str:
     return "".join(out)
 
 
-def message_content(text: str, markdown: bool = False) -> dict:
-    """Content of an m.text message. With `markdown` it also carries format and formatted_body (markdown_html); `body` is the
-    raw text either way, which is what a client without HTML shows."""
-    content = {"msgtype": "m.text", "body": text}
+def message_content(text: str, markdown: bool = False, notice: bool = False) -> dict:
+    """Content of an m.text message (an m.notice with `notice`). With `markdown` it also carries format and formatted_body
+    (markdown_html); `body` is the raw text either way, which is what a client without HTML shows."""
+    content = {"msgtype": "m.notice" if notice else "m.text", "body": text}
     if markdown:
         content.update({"format": HTML_FORMAT, "formatted_body": markdown_html(text)})
     return content

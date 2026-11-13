@@ -168,26 +168,29 @@ class SbxChat(Plugin):
     @web.post("/send")
     async def send(self, request: Request) -> Response:
         """A message into a room of this plugin. Plain text unless `markdown` is true: then the text also goes out as HTML
-        built by core.markdown_html (escaped first, a few closed spans converted), and `body` stays the raw text. `markdown`
-        and `thread` are repeated in the answer, so that a caller can tell a plugin that knew the field from an older one
-        that ignored it (which would have sent the text unformatted, or into the main timeline)."""
+        built by core.markdown_html (escaped first, a few closed spans converted), and `body` stays the raw text. `notice`
+        true makes it an m.notice (shown dimmed, never notifies) instead of an m.text. `markdown`, `notice` and `thread` are
+        repeated in the answer, so that a caller can tell a plugin that knew the field from an older one that ignored it
+        (which would have sent the text unformatted, as m.text, or into the main timeline)."""
         try:
             nonce, data = await self._read(request)
             room, text = core.parse_send(data)
             thread = core.parse_thread(data)
             markdown = core.parse_markdown(data)
+            notice = core.parse_notice(data)
             await self._need_room(room)
-            known = {**({"thread": thread} if thread else {}), **({"markdown": True} if markdown else {})}
-            if thread is None and self._hold(room, text, markdown):
+            known = {**({"thread": thread} if thread else {}), **({"markdown": True} if markdown else {}),
+                     **({"notice": True} if notice else {})}
+            if thread is None and self._hold(room, text, markdown, notice):
                 # 202: accepted, sent after the owner's join; there is no event ID yet. A reply in a thread is never held:
                 # it answers a message of this account, which the owner can only have read after the join.
                 return self._reply(nonce, 202, {"event": None, "held": True, **known})
-            if thread is None and not markdown:
+            if thread is None and not markdown and not notice:
                 event_id = await self.client.send_message(room, _message(text))
             else:
-                # A reply in the thread of `thread` (a message of this account, e.g. an answer), or a formatted message:
-                # built as a dict (plain text unless core.message_content adds the HTML).
-                content = core.message_content(text, markdown)
+                # A reply in the thread of `thread` (a message of this account, e.g. an answer), a formatted message or a
+                # notice: built as a dict (plain text unless core.message_content adds the HTML).
+                content = core.message_content(text, markdown, notice)
                 if thread:
                     content["m.relates_to"] = core.thread_relation(thread)
                 event_id = await self.client.send_message_event(room, EventType.ROOM_MESSAGE, content)
@@ -197,6 +200,24 @@ class SbxChat(Plugin):
         except Exception:
             self.log.exception("send failed")
             return self._reply(await self._nonce_of(request), 502, {"error": "could not send"})
+
+    @web.post("/typing")
+    async def typing(self, request: Request) -> Response:
+        """The bot's typing notification in a room of this plugin (`PUT /rooms/{roomId}/typing/{userId}`, mautrix
+        `client.set_typing`): `typing` true shows it for `timeout` milliseconds, false ends it at once. It is ephemeral: no event
+        in the timeline, nothing to edit or redact, and it ends by itself when the timeout runs out, so a caller that dies
+        leaves nothing behind. The caller refreshes it while it works (the spec recommends every 20 to 30 seconds)."""
+        try:
+            nonce, data = await self._read(request)
+            room, timeout = core.parse_typing(data)
+            await self._need_room(room)
+            await self.client.set_typing(room, timeout)
+            return self._reply(nonce, 200, {"typing": timeout > 0})
+        except core.Refused as error:
+            return self._refused(error)
+        except Exception:
+            self.log.exception("typing failed")
+            return self._reply(await self._nonce_of(request), 502, {"error": "could not set typing"})
 
     @web.post("/edit")
     async def edit(self, request: Request) -> Response:
@@ -539,8 +560,8 @@ class SbxChat(Plugin):
         except Exception:
             return {}
 
-    def _hold(self, room: str, text: str, markdown: bool = False) -> bool:
-        """True if the text (and whether it is to be formatted) was kept for the owner's join. False if the room is not waiting for the owner, or has waited
+    def _hold(self, room: str, text: str, markdown: bool = False, notice: bool = False) -> bool:
+        """True if the text (and whether it is to be formatted, and whether it is a notice) was kept for the owner's join. False if the room is not waiting for the owner, or has waited
         longer than HOLD_MAX: then whatever was held is dropped and the text is sent at once."""
         waiting = self.awaiting.get(room)
         if waiting is None:
@@ -549,7 +570,7 @@ class SbxChat(Plugin):
             self.awaiting.pop(room, None)
             self.log.warning("the owner never joined %s: dropped %d held message(s)", room, len(waiting[1]))
             return False
-        waiting[1].append((text, markdown))
+        waiting[1].append((text, markdown, notice))
         return True
 
     @staticmethod
@@ -648,11 +669,11 @@ class SbxChat(Plugin):
                 self.log.exception("could not drop the group session of %s", evt.room_id)
         # Only now, with the new session, can the owner read the notices the daemon sent before the join.
         waiting = self.awaiting.pop(evt.room_id, None)
-        for text, markdown in waiting[1] if waiting else []:
+        for text, markdown, notice in waiting[1] if waiting else []:
             try:
-                if markdown:
+                if markdown or notice:
                     await self.client.send_message_event(evt.room_id, EventType.ROOM_MESSAGE,
-                                                         core.message_content(text, True))
+                                                         core.message_content(text, markdown, notice))
                 else:
                     await self.client.send_message(evt.room_id, _message(text))
             except Exception:
