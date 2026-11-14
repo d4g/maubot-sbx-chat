@@ -52,8 +52,11 @@ MEDIA_ID = re.compile(r"[A-Za-z0-9_-]{16,64}")
 WAIT_MAX = 30
 # The sub-spaces a session room can be put in (the keys of the config's `spaces`, besides `parent`) and the names they are
 # created with. The owner sees the names in Element, so these are what the owner reads; the keys are what the caller sends.
-SUBSPACES = {"dev": "Dev", "orchestrator": "Orchestrator", "rp": "Rollenspiel"}
+SUBSPACES = {"dev": "Dev", "orchestrator": "Orchestrator", "rp": "RP"}      # rp was "Rollenspiel" until 0.9.0
 PARENT_SPACE = "Agent sandbox"
+# The sub-space of the fixed rooms (the control room and the approval room of sbx-approval), config key `spaces.admin`. Not in
+# SUBSPACES: /room and /place never put a session room there. Wish of the user 2026-11-14.
+ADMIN_SPACE = "Admin"
 
 
 class Refused(Exception):

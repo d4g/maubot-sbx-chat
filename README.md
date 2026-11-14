@@ -139,8 +139,9 @@ way; a caller must check it before it trusts the answer. `core.sign_request` and
 ## Spaces
 
 The owner's room list stays ordered by Matrix spaces, which the plugin makes itself on the first `/spaces` (the caller sends it when it
-starts), or the first time a room is placed (`/room` with `space`, or `/place`): a parent space "Agent sandbox" (the control room, the `approval_room`, and three sub-spaces) and
-the sub-spaces "Dev", "Orchestrator" and "Rollenspiel". They are private (invite only, not in the directory), **not
+starts), or the first time a room is placed (`/room` with `space`, or `/place`): a parent space "Agent sandbox" with the sub-spaces "Dev", "Orchestrator" and "RP" for the session rooms and "Admin" for the
+control room and the `approval_room` (since 0.9.0; before, those two sat in the parent, and the next start moves them, and the rp
+space was called "Rollenspiel", which the next start renames: a space whose name differs from the plugin's is renamed). They are private (invite only, not in the directory), **not
 encrypted** (a space carries only names and links, which the owner's own homeserver sees anyway), and the owner is invited
 with power level 100 next to the bot so the owner can move rooms by hand. Their IDs are saved with the instance config
 (`spaces.*`, `self.config.save()`) right after each is made, so a restart never makes a second copy. A space the owner

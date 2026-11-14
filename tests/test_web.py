@@ -39,11 +39,15 @@ class FakeApi:
         self.stored = {}
         # (space, child room) -> content of the m.space.child as the server holds it; absent = never set (a real 404).
         self.children = {}
+        # room -> its m.room.name, as the server holds it
+        self.names = {}
 
     async def request(self, method, path, **kwargs):
         parts = [urllib.parse.unquote(p) for p in str(path).split("/")]
         if "m.space.child" in parts:
             return self.children[(parts[parts.index("rooms") + 1], parts[-1])]
+        if "m.room.name" in parts:
+            return {"name": self.names[parts[parts.index("rooms") + 1]]}
         return self.stored[parts[-1]]
 
 
@@ -104,6 +108,8 @@ class FakeClient:
             content.pop("is_direct", None)             # the default of MemberStateEventContent, not what the tests are about
         self.sent.append((room, str(event_type), content))
         self.state_keys.append(state_key)
+        if str(event_type) == "m.room.name":
+            self.api.names[room] = content.get("name")
         if str(event_type) == "m.space.child":
             if content:
                 self.api.children[(room, state_key)] = content
@@ -115,6 +121,7 @@ class FakeClient:
         self.created.append(kwargs)
         if (kwargs.get("creation_content") or {}).get("type") == "m.space":
             self.spaces_made += 1
+            self.api.names[f"!space{self.spaces_made}:example.org"] = kwargs.get("name")
             return f"!space{self.spaces_made}:example.org"
         return "!new:example.org"
 
@@ -665,10 +672,11 @@ async def test_the_spaces_are_made_once_and_saved(setup):
     plugin, client = setup
     assert (await call(client, "/place", {"room": SESSION, "space": "dev"}))[:2] == (200, {"space": "dev"})
     made = plugin.client.created
-    assert [m["name"] for m in made] == ["Agent sandbox", "Dev", "Orchestrator", "Rollenspiel"]
+    assert [m["name"] for m in made] == ["Agent sandbox", "Dev", "Orchestrator", "RP", "Admin"]
     parent = plugin.config["spaces.parent"]
     assert parent == "!space1:example.org" and plugin.config["spaces.rp"] == "!space4:example.org"
-    assert plugin.config.saves == 4                       # saved after every space, not once at the end
+    assert plugin.config["spaces.admin"] == "!space5:example.org"
+    assert plugin.config.saves == 5                       # saved after every space, not once at the end
     for m in made:
         assert m["creation_content"] == {"type": "m.space"} and m["invitees"] == [OWNER] and m["is_direct"] is False
         assert "preset" not in m                          # create_room's default: private, invite only
@@ -677,18 +685,19 @@ async def test_the_spaces_are_made_once_and_saved(setup):
     assert made[0]["initial_state"] == []                 # the parent has no parent
     assert made[1]["initial_state"] == [{"type": "m.space.parent", "state_key": parent,
                                          "content": {"via": ["example.org"], "canonical": True}}]
-    # the parent holds the three sub-spaces, the control room and the approval room; Dev holds the placed session
+    # the parent holds the four sub-spaces; Admin the control room and the approval room; Dev the placed session
     assert children(plugin, parent) == sorted(["!space2:example.org", "!space3:example.org", "!space4:example.org",
-                                               CONTROL, APPROVAL])
+                                               "!space5:example.org"])
+    assert children(plugin, "!space5:example.org") == sorted([CONTROL, APPROVAL])
     assert children(plugin, "!space2:example.org") == [SESSION]
-    assert plugin.client.api.children[(parent, CONTROL)] == {"via": ["example.org"]}
+    assert plugin.client.api.children[("!space5:example.org", CONTROL)] == {"via": ["example.org"]}
     # a second request, and a restart (a new plugin object over the same config and server), make nothing new
     await call(client, "/place", {"room": SESSION, "space": "dev"})
-    assert plugin.client.spaces_made == 4
+    assert plugin.client.spaces_made == 5
     again = make_plugin()
     again.client, again.config = plugin.client, plugin.config
     await again._ensure_spaces()
-    assert plugin.client.spaces_made == 4 and plugin.config.saves == 4
+    assert plugin.client.spaces_made == 5 and plugin.config.saves == 5
 
 
 async def test_a_crash_between_two_spaces_does_not_make_a_second_copy(setup):
@@ -707,7 +716,7 @@ async def test_a_crash_between_two_spaces_does_not_make_a_second_copy(setup):
     assert plugin.config["spaces.parent"] and plugin.config["spaces.dev"] and not plugin.config["spaces.orchestrator"]
     plugin.client.create_room = real
     assert (await call(client, "/place", {"room": SESSION, "space": "dev"}))[0] == 200
-    assert plugin.client.spaces_made == 4                 # parent, dev, then orchestrator and rp: four in all, none twice
+    assert plugin.client.spaces_made == 5                 # parent, dev, then orchestrator, rp and admin: five, none twice
 
 
 async def test_spaces_makes_the_layout_without_a_room(setup):
@@ -715,12 +724,14 @@ async def test_spaces_makes_the_layout_without_a_room(setup):
     status, body, signed = await call(client, "/spaces", {})
     assert status == 200 and signed
     assert body == {"spaces": {"parent": "!space1:example.org", "dev": "!space2:example.org",
-                               "orchestrator": "!space3:example.org", "rp": "!space4:example.org"}}
+                               "orchestrator": "!space3:example.org", "rp": "!space4:example.org",
+                               "admin": "!space5:example.org"}}
     assert children(plugin, "!space1:example.org") == sorted(["!space2:example.org", "!space3:example.org",
-                                                              "!space4:example.org", CONTROL, APPROVAL])
+                                                              "!space4:example.org", "!space5:example.org"])
+    assert children(plugin, "!space5:example.org") == sorted([CONTROL, APPROVAL])
     assert children(plugin, "!space2:example.org") == []
     assert (await call(client, "/spaces", {}))[:2] == (200, body)     # a second call makes nothing new
-    assert plugin.client.spaces_made == 4
+    assert plugin.client.spaces_made == 5
 
 
 async def test_spaces_failure_is_a_signed_502(setup):
@@ -808,6 +819,7 @@ async def test_an_unset_approval_room_is_skipped(setup):
     plugin, client = setup
     plugin.config["approval_room"] = ""
     await call(client, "/place", {"room": SESSION, "space": "dev"})
+    assert APPROVAL not in children(plugin, plugin.config["spaces.admin"])
     assert APPROVAL not in children(plugin, plugin.config["spaces.parent"])
 
 
@@ -844,18 +856,50 @@ async def test_archive_works_when_the_space_is_unreachable(setup):
     assert plugin.client.left == [SESSION]
 
 
-async def test_the_control_room_and_the_approval_room_are_in_the_parent_space(setup):
+async def test_the_control_room_and_the_approval_room_are_in_the_admin_space(setup):
     plugin, client = setup
     await plugin._ensure_spaces()
-    parent = plugin.config["spaces.parent"]
-    assert {CONTROL, APPROVAL} <= set(children(plugin, parent))
+    parent, admin = plugin.config["spaces.parent"], plugin.config["spaces.admin"]
+    assert children(plugin, admin) == sorted([CONTROL, APPROVAL]) and not {CONTROL, APPROVAL} & set(children(plugin, parent))
+    assert (await call(client, "/place", {"room": SESSION, "space": "admin"}))[0] == 400     # no session room goes there
+
+
+async def test_an_existing_layout_moves_the_two_rooms_from_the_parent_into_admin(setup):
+    plugin, client = setup
+    await plugin._ensure_spaces()
+    parent, admin = plugin.config["spaces.parent"], plugin.config["spaces.admin"]
+    # as 0.8.x left it: no Admin space yet, both rooms children of the parent
+    plugin.config["spaces.admin"] = ""
+    for room in (CONTROL, APPROVAL):
+        await plugin.client.send_state_event(parent, EventType.SPACE_CHILD, {"via": ["example.org"]}, state_key=room)
+    again = make_plugin()
+    again.client, again.config = plugin.client, plugin.config
+    await again._ensure_spaces()
+    admin = plugin.config["spaces.admin"]
+    assert children(plugin, admin) == sorted([CONTROL, APPROVAL])
+    assert not {CONTROL, APPROVAL} & set(children(plugin, parent)) and admin in children(plugin, parent)
+
+
+async def test_an_existing_space_with_the_old_name_is_renamed_once(setup):
+    plugin, client = setup
+    await plugin._ensure_spaces()
+    rp = plugin.config["spaces.rp"]
+    plugin.client.api.names[rp] = "Rollenspiel"            # as 0.8.x named it
+    plugin.client.sent.clear()
+    again = make_plugin()
+    again.client, again.config = plugin.client, plugin.config
+    await again._ensure_spaces()
+    assert plugin.client.api.names[rp] == "RP" and [(r, t) for r, t, _ in plugin.client.sent] == [(rp, "m.room.name")]
+    plugin.client.sent.clear()
+    await again._ensure_spaces()
+    assert plugin.client.sent == []                        # the right name: nothing sent
 
 
 async def test_two_requests_at_once_make_the_spaces_once(setup):
     plugin, client = setup
     answers = await asyncio.gather(*[call(client, "/place", {"room": SESSION, "space": key})
                                      for key in ("dev", "orchestrator", "rp", "dev")])
-    assert [a[0] for a in answers] == [200] * 4 and plugin.client.spaces_made == 4
+    assert [a[0] for a in answers] == [200] * 4 and plugin.client.spaces_made == 5
 
 
 # --- formatted messages, threads in, redaction --------------------------------------------------------------------

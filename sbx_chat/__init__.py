@@ -51,7 +51,7 @@ def _cached_membership(evt) -> Membership | None:
 class Config(BaseProxyConfig):
     def do_update(self, helper: ConfigUpdateHelper) -> None:
         for key in ("owner", "room_id", "secret", "approval_room", "spaces.parent", "spaces.dev", "spaces.orchestrator",
-                    "spaces.rp"):
+                    "spaces.rp", "spaces.admin"):
             helper.copy(key)
 
 
@@ -377,7 +377,7 @@ class SbxChat(Plugin):
             nonce, _ = await self._read(request)
             await self._ensure_spaces()
             return self._reply(nonce, 200, {"spaces": {key: self.config[f"spaces.{key}"]
-                                                       for key in ("parent", *core.SUBSPACES)}})
+                                                       for key in ("parent", *core.SUBSPACES, "admin")}})
         except core.Refused as error:
             return self._refused(error)
         except Exception:
@@ -487,10 +487,12 @@ class SbxChat(Plugin):
         return self.client.mxid.split(":", 1)[1]
 
     async def _ensure_spaces(self) -> None:
-        """Make the spaces that do not exist yet, and link the fixed rooms into the parent space.
+        """Make the spaces that do not exist yet, and link the fixed rooms into the sub-space Admin.
 
-        Layout: the parent space "Agent sandbox" holds the control room, the approval room of sbx-approval (config
-        `approval_room`) and three sub-spaces (core.SUBSPACES). All are private (invite only), not in the room directory,
+        Layout: the parent space "Agent sandbox" holds three sub-spaces for the session rooms (core.SUBSPACES) and the
+        sub-space "Admin" (core.ADMIN_SPACE), which holds the control room and the approval room of sbx-approval (config
+        `approval_room`). Until 0.9.0 those two were children of the parent; a live link there is removed, so an existing
+        layout moves by itself at the next start. All spaces are private (invite only), not in the room directory,
         and not encrypted: a space carries no messages, only names and links, which the owner's own homeserver sees anyway.
         The owner is invited and gets power level 100 next to the bot, so the owner can move rooms in and out by hand.
 
@@ -502,17 +504,29 @@ class SbxChat(Plugin):
             parent = await self._make_space("parent", core.PARENT_SPACE, None)
             for key, name in core.SUBSPACES.items():
                 await self._make_space(key, name, parent)
+            admin = await self._make_space("admin", core.ADMIN_SPACE, parent)
             for room in (self.config["room_id"], self.config["approval_room"]):
                 if room:
                     try:
-                        await self._add_child(parent, room)
+                        await self._add_child(admin, room)
+                        if (parent, room) in self.linked or await self._child_linked(parent, room):
+                            await self._remove_child(parent, room)
                     except Exception:
-                        self.log.exception("could not put %s into the parent space", room)
+                        self.log.exception("could not put %s into the space Admin", room)
 
     async def _make_space(self, key: str, name: str, parent: str | None) -> str:
-        """The ID of the space `key` from the config; made, saved and (for a sub-space) linked below `parent` if missing."""
+        """The ID of the space `key` from the config; made, saved and (for a sub-space) linked below `parent` if missing. An
+        existing space gets `name` if its name differs (best effort: unreadable or refused is logged and left), so a renamed
+        space here (Rollenspiel to RP in 0.9.0) is renamed on the server at the next start."""
         existing = self.config[f"spaces.{key}"]
         if existing:
+            try:
+                current = await self.client.api.request(Method.GET, Path.v3.rooms[existing].state["m.room.name"][""])
+                if isinstance(current, dict) and current.get("name") != name:
+                    await self.client.send_state_event(existing, EventType.ROOM_NAME, {"name": name})
+                    self.log.info("renamed the space %s to %s", existing, name)
+            except Exception:
+                self.log.warning("could not check the name of the space %s", key)
             if parent:
                 try:
                     await self._add_child(parent, existing)    # a no-op if it is linked; repairs a link lost after a crash
