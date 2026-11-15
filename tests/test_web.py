@@ -1117,3 +1117,96 @@ async def test_typing(setup):
     status, body, _ = await call(client, "/typing", {"room": FOREIGN, "typing": True, "timeout": 1000})
     assert (status, body["error"]) == (403, "not a room of this plugin")
     assert len(plugin.client.typing) == 2
+
+
+# --- /image: an image sent into a room ------------------------------------------------------------------------------
+
+# The first bytes of a real 1024x768 PNG (Pillow): the plugin reads the header only, and encrypts whatever follows.
+OUT_PNG = bytes.fromhex("89504e470d0a1a0a0000000d494844520000040000000300080200000035d8825a00") + bytes(range(256)) * 8
+
+
+def decrypted(plugin, content):
+    """The plaintext of the attachment an m.image content points at, as the owner's client would get it."""
+    file = content["file"]
+    return sbx_chat.decrypt_attachment(plugin.client.files_up[file["url"]], file["key"]["k"], file["hashes"]["sha256"], file["iv"])
+
+
+@pytest.fixture
+def uploads(setup):
+    """setup, with the fake media repository keeping what was uploaded under the URL it answered."""
+    plugin, client = setup
+    plugin.client.files_up = {}
+    upload = plugin.client.upload_media
+
+    async def keep(data, mime_type=None, filename=None):
+        url = await upload(data, mime_type, filename)
+        plugin.client.files_up[url] = bytes(data)
+        return url
+    plugin.client.upload_media = keep
+    return plugin, client
+
+
+async def test_image_goes_out_as_an_encrypted_attachment(uploads):
+    plugin, client = uploads
+    status, body, signed = await call(client, "/image", {"room": SESSION, "data": b64png(OUT_PNG)})
+    assert (status, signed) == (201, True)
+    assert body == {"event": "$ev1", "mime": "image/png", "width": 1024, "height": 768}
+    [(cipher, mime, filename)] = plugin.client.uploads
+    # Only ciphertext reaches the media repository, without the real type or a name.
+    assert (mime, filename) == ("application/octet-stream", None) and cipher != OUT_PNG and OUT_PNG[:16] not in cipher
+    room, kind, content = plugin.client.sent[-1]
+    assert (room, kind, content["msgtype"], content["body"]) == (SESSION, "m.room.message", "m.image", "image.png")
+    assert content["info"] == {"mimetype": "image/png", "size": len(OUT_PNG), "w": 1024, "h": 768}
+    assert "url" not in content and content["file"]["url"] == "mxc://example.org/up1" and "filename" not in content
+    assert set(content["file"]) >= {"url", "key", "iv", "hashes", "v"}
+    assert decrypted(plugin, content) == OUT_PNG
+
+
+async def test_image_with_caption_name_and_thread(uploads):
+    plugin, client = uploads
+    status, body, _ = await call(client, "/image", {"room": SESSION, "data": b64png(OUT_PNG), "name": "inn.png",
+                                                    "caption": "The inn at dusk", "thread": "$root"})
+    assert status == 201 and body["thread"] == "$root"
+    content = plugin.client.sent[-1][2]
+    assert (content["body"], content["filename"]) == ("The inn at dusk", "inn.png")
+    assert content["m.relates_to"] == core.thread_relation("$root")
+
+
+async def test_image_is_refused_where_it_does_not_belong(uploads):
+    plugin, client = uploads
+    for room, status in ((CONTROL, 403), (FOREIGN, 403)):
+        assert (await call(client, "/image", {"room": room, "data": b64png(OUT_PNG)}))[0] == status
+    for bad in ({"room": SESSION, "data": b64png(b"GIF89a" + bytes(40))}, {"room": SESSION, "data": ""},
+                {"room": SESSION, "data": b64png(OUT_PNG), "thread": "root"}, {"room": SESSION, "data": b64png(OUT_PNG), "name": "../x"}):
+        assert (await call(client, "/image", bad))[0] == 400
+    assert plugin.client.uploads == [] and plugin.client.sent == []
+
+
+async def test_image_into_a_room_the_owner_has_not_joined_is_refused_not_held(uploads):
+    plugin, client = uploads
+    room = "!new:example.org"
+    plugin.client.creators[room] = BOT
+    assert (await call(client, "/room", {"name": "rp/x"}))[0] == 201
+    status, body, signed = await call(client, "/image", {"room": room, "data": b64png(OUT_PNG)})
+    assert (status, signed) == (409, False) and plugin.client.uploads == []
+    await plugin.on_member(member(room, OWNER, Membership.JOIN))
+    assert (await call(client, "/image", {"room": room, "data": b64png(OUT_PNG)}))[0] == 201
+
+
+async def test_a_large_image_arrives_whole_and_one_over_the_limit_is_refused(uploads):
+    plugin, client = uploads
+    big = OUT_PNG + bytes(3 * 1024 * 1024)
+    assert (await call(client, "/image", {"room": SESSION, "data": b64png(big)}))[0] == 201
+    assert decrypted(plugin, plugin.client.sent[-1][2]) == big
+    over = OUT_PNG + bytes(core.IMAGE_MAX)
+    assert (await call(client, "/image", {"room": SESSION, "data": b64png(over)}))[0] == 413
+
+
+async def test_image_upload_failure_is_a_signed_502(uploads):
+    plugin, client = uploads
+
+    async def broken(data, mime_type=None, filename=None):
+        raise RuntimeError("media repository down")
+    plugin.client.upload_media = broken
+    status, body, signed = await call(client, "/image", {"room": SESSION, "data": b64png(OUT_PNG)})
+    assert (status, body, signed) == (502, {"error": "could not send the image"}, True) and plugin.client.sent == []

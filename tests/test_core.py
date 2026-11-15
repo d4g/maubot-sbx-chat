@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import hmac
 import pathlib
@@ -351,3 +352,75 @@ def test_inbox_item_carries_the_thread():
     first, second, third = inbox.since(None, 0)
     assert first["thread"] == "$root" and second["thread"] == "$root" and second["image"]["id"] == "i"
     assert "thread" not in third
+
+
+# --- images sent into a room (/image) ---------------------------------------------------------------------------------
+
+# The first bytes of real files of 1024x768, written by Pillow 2026-11-15: enough for image_info, which reads only headers.
+PNG_HEAD = bytes.fromhex("89504e470d0a1a0a0000000d494844520000040000000300080200000035d8825a00")
+WEBP_LOSSY = bytes.fromhex("52494646b80500005745425056503820ac05000070a8009d012a000400033e31188c")
+WEBP_LOSSLESS = bytes.fromhex("5249464644000000574542505650384c380000002fffc3bf0007508a2ad4a3ff0181")
+WEBP_EXTENDED = bytes.fromhex("524946460406000057454250565038580a00000010000000ff0300ff0200414c5048")
+# A JPEG as far as its frame header: SOI, an APP0 segment, a quantisation table, then SOF0 (or SOF2, progressive).
+JPEG_HEAD = (bytes.fromhex("ffd8ffe000104a46494600010100000100010000") + b"\xff\xdb\x00\x43" + bytes(65)
+             + bytes.fromhex("ffc0001108030004000301220002110103110100"))
+
+
+def b64(data):
+    return base64.b64encode(data).decode()
+
+
+@pytest.mark.parametrize("data, mime", [(PNG_HEAD, "image/png"), (WEBP_LOSSY, "image/webp"), (WEBP_LOSSLESS, "image/webp"),
+                                        (WEBP_EXTENDED, "image/webp"), (JPEG_HEAD, "image/jpeg"),
+                                        (JPEG_HEAD.replace(b"\xff\xc0\x00\x11", b"\xff\xc2\x00\x11"), "image/jpeg")])
+def test_image_info_reads_type_and_size_from_the_header(data, mime):
+    assert core.image_info(data) == (mime, 1024, 768)
+
+
+def test_image_info_of_a_cut_header_keeps_the_type_without_a_size():
+    assert core.image_info(PNG_HEAD[:12]) == ("image/png", None, None)
+    assert core.image_info(WEBP_LOSSY[:20]) == ("image/webp", None, None)
+    assert core.image_info(JPEG_HEAD[:30]) == ("image/jpeg", None, None)
+    # a table marker (DHT, C4) is no frame, and a segment length below 2 ends the search instead of looping
+    assert core.image_info(b"\xff\xd8\xff\xc4\x00\x00" + bytes(20)) == ("image/jpeg", None, None)
+
+
+@pytest.mark.parametrize("data", [b"", b"GIF89a" + bytes(30), b"<svg xmlns='http://www.w3.org/2000/svg'/>", b"RIFF" + bytes(4) + b"WAVE",
+                                  bytes(40)])
+def test_image_info_knows_nothing_else(data):
+    assert core.image_info(data) is None
+
+
+def test_parse_image_takes_the_type_from_the_bytes_and_names_the_file():
+    picture = core.parse_image({"room": "!a:b", "data": b64(WEBP_LOSSY), "mime": "image/png"})
+    assert picture == {"room": "!a:b", "data": WEBP_LOSSY, "mime": "image/webp", "width": 1024, "height": 768,
+                       "name": "image.webp", "caption": None}
+    picture = core.parse_image({"room": "!a:b", "data": b64(JPEG_HEAD), "name": "scene-2.jpg", "caption": "The inn at dusk"})
+    assert (picture["name"], picture["caption"], picture["mime"]) == ("scene-2.jpg", "The inn at dusk", "image/jpeg")
+
+
+def test_parse_image_refuses_bad_requests():
+    good = {"room": "!a:b", "data": b64(PNG_HEAD)}
+    for change, status in (({"data": ""}, 400), ({"data": 5}, 400), ({"data": "not base64!"}, 400),
+                           ({"data": b64(b"GIF89a" + bytes(30))}, 400), ({"room": "x"}, 400),
+                           ({"name": "a/b.png"}, 400), ({"name": ".hidden"}, 400), ({"name": "x" * 81}, 400), ({"name": 5}, 400),
+                           ({"name": "a b.png"}, 400), ({"caption": ""}, 400), ({"caption": "  "}, 400), ({"caption": 5}, 400),
+                           ({"caption": "x" * (core.CAPTION_MAX + 1)}, 413),
+                           ({"data": b64(PNG_HEAD + bytes(core.IMAGE_MAX))}, 413)):
+        with pytest.raises(core.Refused) as error:
+            core.parse_image({**good, **change})
+        assert error.value.status == status, change
+    with pytest.raises(core.Refused):
+        core.parse_image([])
+
+
+def test_image_content_with_and_without_a_caption():
+    picture = core.parse_image({"room": "!a:b", "data": b64(PNG_HEAD)})
+    file = {"url": "mxc://example.org/x", "v": "v2"}
+    assert core.image_content(picture, file) == {
+        "msgtype": "m.image", "body": "image.png", "file": file,
+        "info": {"mimetype": "image/png", "size": len(PNG_HEAD), "w": 1024, "h": 768}}
+    captioned = core.image_content({**picture, "caption": "Mira"}, file)
+    assert (captioned["body"], captioned["filename"]) == ("Mira", "image.png")
+    assert core.caption_of(captioned) == "Mira" and core.caption_of(core.image_content(picture, file)) == ""
+    assert "w" not in core.image_content({**picture, "width": None, "height": None}, file)["info"]

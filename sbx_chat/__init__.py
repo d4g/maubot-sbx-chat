@@ -12,7 +12,7 @@ from aiohttp.web import Request, Response
 from maubot import Plugin
 from maubot.handlers import event, web
 from mautrix.api import Method, Path
-from mautrix.crypto.attachments import decrypt_attachment
+from mautrix.crypto.attachments import decrypt_attachment, encrypt_attachment
 from mautrix.types import (EncryptedEvent, Event, EventType, MemberStateEventContent, Membership, MessageType,
                            RoomAvatarStateEventContent, TextMessageEventContent)
 from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
@@ -226,6 +226,40 @@ class SbxChat(Plugin):
         except Exception:
             self.log.exception("send failed")
             return self._reply(await self._nonce_of(request), 502, {"error": "could not send"})
+
+    @web.post("/image")
+    async def image(self, request: Request) -> Response:
+        """An image into a session room, as an end-to-end encrypted attachment: the bytes are encrypted here the way a
+        client does it (AES-CTR, mautrix `encrypt_attachment`), only the ciphertext is uploaded to the homeserver's media
+        repository (as application/octet-stream, without a file name), and the key travels in the m.image event, which is
+        encrypted like every message of the room. `thread` makes it a reply in that thread, as for /send. Never in the
+        control room (the owner's images are not taken there either). While the owner has not joined a new room the image
+        is refused with 409, not held: a held text costs a few bytes, a held image megabytes, and the caller can send it
+        again."""
+        try:
+            nonce, data = await self._read(request, core.SEND_IMAGE_BODY_MAX)
+            picture = core.parse_image(data)
+            thread = core.parse_thread(data)
+            room = picture["room"]
+            if room == self.config["room_id"]:
+                raise core.Refused(403, "images go into a session room")
+            await self._need_room(room)
+            waiting = self.awaiting.get(room)
+            if waiting is not None and time.monotonic() - waiting[0] <= HOLD_MAX:
+                raise core.Refused(409, "the owner has not joined the room yet")
+            cipher, file = encrypt_attachment(picture["data"])
+            url = await self.client.upload_media(cipher, mime_type="application/octet-stream")
+            content = core.image_content(picture, dict(file.serialize(), url=str(url)))
+            if thread:
+                content["m.relates_to"] = core.thread_relation(thread)
+            event_id = await self.client.send_message_event(room, EventType.ROOM_MESSAGE, content)
+            return self._reply(nonce, 201, {"event": event_id, "mime": picture["mime"], "width": picture["width"],
+                                            "height": picture["height"], **({"thread": thread} if thread else {})})
+        except core.Refused as error:
+            return self._refused(error)
+        except Exception:
+            self.log.exception("image failed")
+            return self._reply(await self._nonce_of(request), 502, {"error": "could not send the image"})
 
     @web.post("/typing")
     async def typing(self, request: Request) -> Response:

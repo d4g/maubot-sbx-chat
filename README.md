@@ -10,7 +10,7 @@ It holds no session state and runs no model or agent. The program behind it is `
 ADR 0027 ("Matrix chat front end for the sessions of the local boxes"). It reuses the pattern of
 [maubot-sbx-approval](https://github.com/d4g/maubot-sbx-approval) (ADR 0024).
 
-**Status:** version 0.8.1 (formatted messages, threads in events, redaction, reactions, notices, typing; 0.8.1: one Megolm session per room again, see "A new key when the owner joins"), tested off-line (logic, and the HTTP endpoints of the real plugin class against maubot 0.6.0 /
+**Status:** version 0.10.0 (formatted messages, threads in events, redaction, reactions, notices, typing; 0.8.1: one Megolm session per room again, see "A new key when the owner joins"; 0.9.0: the sub-space Admin; 0.10.0: `POST /image`), tested off-line (logic, and the HTTP endpoints of the real plugin class against maubot 0.6.0 /
 mautrix 0.21.1 with a fake Matrix client, routed as maubot routes them). Not yet run against a real homeserver.
 
 ## Design in brief
@@ -61,6 +61,7 @@ signed, stale or replayed request gets `401` without a signature, and `503` whil
 | `POST /redact` | `{"room", "event"}` — `event` is an event ID: a string starting with `$`, no whitespace, at most 201 characters (`400` otherwise) | `200 {"redacted": true}` — the event is redacted (its content removed, irreversibly); `403` for the control room and for a room this plugin did not make; `502` when the homeserver refuses (for example the bot lacks the power to redact that event) |
 | `POST /react` | `{"room", "event", "key"}` — `event` as for `/redact`; `key` is what the reaction shows (an emoji, say `🔁`): 1 to 32 characters, none a control character (`400` otherwise) | `200 {"event"}` — an `m.reaction` of the bot with `m.relates_to` `rel_type` `m.annotation` was sent; `403` for the control room and for a room this plugin did not make; `502` when the homeserver refuses |
 | `POST /typing` | `{"room", "typing", "timeout"?}` — `typing` a JSON boolean; with `true`, `timeout` in milliseconds, 1 to 120000 (`400` otherwise) | `200 {"typing"}` — the bot shows as typing for `timeout` ms, or stops at once with `false`; `403` for a room this plugin did not make; `502` when the homeserver refuses |
+| `POST /image` | `{"room", "data", "name"?, "caption"?, "thread"?}` — `data`: a PNG, JPEG or WebP as base64, ≤ 10 MiB (the type is read from the bytes, never taken from the caller; anything else is `400`); `name`: the file name shown, 1 to 80 of `[A-Za-z0-9._-]`, default `image.<type>`; `caption`: text shown with the picture, ≤ 4 KiB; `thread` as for `/send` | `201 {"event", "mime", "width", "height", "thread"?}` — an `m.image` with an end-to-end encrypted attachment (see "Images sent into a room"); `width` and `height` are `null` if the header did not give them; `403` for the control room and for a room this plugin did not make; `409` while the owner has not joined a new room (not held, send it again); `413`; `502` |
 | `POST /room` | `{"name", "space"?}` — name ≤ 80 characters; `space`: `dev`, `orchestrator` or `rp` (else `400`) | `201 {"room", "space"?}` — private, encrypted from creation, the owner invited. With `space`, the room claims that sub-space (`m.space.parent`) and is listed in it (`m.space.child`); `space` is repeated, `null` if the listing failed (the room is made anyway), so a caller can tell that this version knew the field |
 | `POST /spaces` | `{}` | `200 {"spaces": {"parent", "dev", "orchestrator", "rp"}}` (room IDs) — missing spaces made, the control room, the `approval_room` and the sub-spaces linked into the parent; `502` |
 | `POST /place` | `{"room", "space"}` — the control room or a room this plugin made | `200 {"space"}` — listed in that sub-space unless it is already (no event is sent then); `400` bad space, `403` foreign room, `502` |
@@ -108,6 +109,19 @@ the caller notes once and goes on without the reaction.
 `.m.rule.suppress_notices` never notifies for it. A held notice (owner not joined yet) stays a notice when it is sent. The
 caller is `sbx-chat`, for the model switch and the end line of a turn; a plugin older than 0.8.0 ignores the field and
 does not repeat it, so the text arrived as a plain message.
+
+**Images sent into a room.** `/image` (since 0.10.0) sends a picture the caller made, for `sbx-chat` the images of a
+roleplay scene from ComfyUI. The session rooms are end-to-end encrypted, so the picture goes the way a client sends one: the
+plugin encrypts the bytes (AES-CTR with a fresh key, mautrix `mautrix.crypto.attachments.encrypt_attachment`), uploads only the
+ciphertext to the homeserver's media repository (as `application/octet-stream`, without a file name), and puts the key, IV and
+hash into the `file` object of the `m.image` event, which is itself encrypted like every message of the room. The homeserver
+thus holds bytes it cannot read; like every upload they stay there until its admin deletes them. This differs from `/avatar`
+and `/roomicon`, whose pictures Matrix can only store unencrypted. `info` carries the type, the size and, read from the
+image header, width and height, so a client can lay the picture out before it has loaded it. With a `caption`, `body` is the
+caption and `filename` the name (the same convention the plugin reads on the owner's images). An image is never held for the
+owner's join, unlike a text: the answer is `409` and the caller sends it again. Tested off-line with a fake client (the
+uploaded bytes decrypt to the picture); how Element shows it is **not verified** against a real server. A plugin older than
+0.10.0 lacks the route, so maubot answers `404` itself, unsigned.
 
 **Typing.** `/typing` sets the bot's typing notification (`PUT /_matrix/client/v3/rooms/{roomId}/typing/{userId}`, mautrix
 `client.set_typing(room, timeout)`, 0 = stopped). Per the spec (v1.12, "Typing Notifications") it is ephemeral: no

@@ -319,6 +319,93 @@ def parse_avatar(data, clear_ok: bool) -> tuple[str, bytes | None]:
     return room, image
 
 
+# --- images sent into a room (/image) ------------------------------------------------------------------------
+
+# The body of /image: an image of IMAGE_MAX as base64, plus the JSON around it and a caption.
+SEND_IMAGE_BODY_MAX = IMAGE_MAX * 4 // 3 + 16 * 1024
+CAPTION_MAX = 4 * 1024
+FILE_NAME = re.compile(r"[A-Za-z0-9._-]{1,80}")
+SEND_IMAGE_TYPES = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}
+
+
+def image_info(data: bytes) -> tuple[str, int | None, int | None] | None:
+    """(MIME type, width, height) of a PNG, JPEG or WebP, read from its first bytes; None for anything else. The type is
+    never taken from the caller. Width and height are None when the header does not hold them where expected (a client
+    then lays the picture out only after loading it)."""
+    if data.startswith(PNG_MAGIC):
+        if len(data) >= 24 and data[12:16] == b"IHDR":
+            return "image/png", int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+        return "image/png", None, None
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        kind = data[12:16]
+        if kind == b"VP8 " and len(data) >= 30 and data[23:26] == b"\x9d\x01\x2a":
+            return ("image/webp", int.from_bytes(data[26:28], "little") & 0x3FFF,
+                    int.from_bytes(data[28:30], "little") & 0x3FFF)
+        if kind == b"VP8L" and len(data) >= 25 and data[20] == 0x2F:
+            bits = int.from_bytes(data[21:25], "little")
+            return "image/webp", (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+        if kind == b"VP8X" and len(data) >= 30:
+            return "image/webp", int.from_bytes(data[24:27], "little") + 1, int.from_bytes(data[27:30], "little") + 1
+        return "image/webp", None, None
+    if data[:3] == b"\xff\xd8\xff":
+        at = 2
+        while at + 9 <= len(data) and data[at] == 0xFF:
+            marker, length = data[at + 1], int.from_bytes(data[at + 2:at + 4], "big")
+            # The start-of-frame markers hold the size; C4, C8 and CC are tables, not frames.
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                return "image/jpeg", int.from_bytes(data[at + 7:at + 9], "big"), int.from_bytes(data[at + 5:at + 7], "big")
+            if length < 2:
+                break
+            at += 2 + length
+        return "image/jpeg", None, None
+    return None
+
+
+def parse_image(data) -> dict:
+    """What /image sends: dict room, data (the image bytes), mime, width, height, name and caption (None without one).
+    `data` is the image as base64, a PNG, JPEG or WebP of at most IMAGE_MAX. `name` (optional) is the file name a client
+    shows and saves under, `caption` (optional) a text shown with the picture."""
+    data = _object(data)
+    room, raw = _room(data), data.get("data")
+    if not isinstance(raw, str) or not raw:
+        raise Refused(400, "bad data")
+    if len(raw) > SEND_IMAGE_BODY_MAX:
+        raise Refused(413, "image too large")
+    try:
+        image = base64.b64decode(raw, validate=True)
+    except (binascii.Error, ValueError):
+        raise Refused(400, "image is not base64")
+    if len(image) > IMAGE_MAX:
+        raise Refused(413, "image too large")
+    info = image_info(image)
+    if info is None:
+        raise Refused(400, "image is not a PNG, JPEG or WebP")
+    name = data.get("name", "image." + SEND_IMAGE_TYPES[info[0]])
+    if not isinstance(name, str) or not FILE_NAME.fullmatch(name) or name.startswith("."):
+        raise Refused(400, "bad name")
+    caption = data.get("caption")
+    if caption is not None:
+        if not isinstance(caption, str) or not caption.strip():
+            raise Refused(400, "bad caption")
+        if len(caption.encode()) > CAPTION_MAX:
+            raise Refused(413, "caption too long")
+    return {"room": room, "data": image, "mime": info[0], "width": info[1], "height": info[2], "name": name,
+            "caption": caption}
+
+
+def image_content(picture: dict, file: dict) -> dict:
+    """The content of an m.image for an encrypted attachment: `file` is the EncryptedFile (url, key, iv, hashes, v) of the
+    uploaded ciphertext. With a caption, `body` is the caption and `filename` the name (the convention caption_of reads);
+    without one, `body` is the name."""
+    info = {"mimetype": picture["mime"], "size": len(picture["data"])}
+    if picture["width"] and picture["height"]:
+        info["w"], info["h"] = picture["width"], picture["height"]
+    content = {"msgtype": "m.image", "body": picture["caption"] or picture["name"], "info": info, "file": file}
+    if picture["caption"]:
+        content["filename"] = picture["name"]
+    return content
+
+
 def parse_archive(data) -> tuple[str, str]:
     data = _object(data)
     return _room(data), _name(data)
