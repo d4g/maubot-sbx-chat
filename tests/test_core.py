@@ -424,3 +424,58 @@ def test_image_content_with_and_without_a_caption():
     assert (captioned["body"], captioned["filename"]) == ("Mira", "image.png")
     assert core.caption_of(captioned) == "Mira" and core.caption_of(core.image_content(picture, file)) == ""
     assert "w" not in core.image_content({**picture, "width": None, "height": None}, file)["info"]
+
+
+def test_parse_poll_and_its_refusals():
+    assert core.parse_poll({"room": "!r:x", "question": "Which?", "answers": ["a", "b"]}) == ("!r:x", "Which?", ["a", "b"])
+    twenty = [f"o{n}" for n in range(20)]
+    assert core.parse_poll({"room": "!r:x", "question": "q", "answers": twenty})[2] == twenty
+    bad = [{"room": "!r:x", "question": "q", "answers": ["a"]},
+           {"room": "!r:x", "question": "q", "answers": twenty + ["x"]},
+           {"room": "!r:x", "question": "q", "answers": "ab"},
+           {"room": "!r:x", "question": " ", "answers": ["a", "b"]},
+           {"room": "!r:x", "answers": ["a", "b"]},
+           {"room": "!r:x", "question": "q", "answers": ["a", "a"]},
+           {"room": "!r:x", "question": "q", "answers": ["a", ""]},
+           {"room": "!r:x", "question": "q", "answers": ["a", 2]},
+           {"room": "!r:x", "question": "q", "answers": ["a", "b\nc"]},
+           {"room": "!r:x", "question": "q", "answers": ["a", "x" * 201]},
+           {"room": "r", "question": "q", "answers": ["a", "b"]}]
+    for data in bad:
+        with pytest.raises(core.Refused) as err:
+            core.parse_poll(data)
+        assert err.value.status == 400, data
+    with pytest.raises(core.Refused) as err:
+        core.parse_poll({"room": "!r:x", "question": "q" * (core.POLL_QUESTION_MAX + 1), "answers": ["a", "b"]})
+    assert err.value.status == 413
+
+
+def test_poll_start_content_is_built_like_sbx_approval():
+    content = core.poll_start_content("Which preset?", ["heretic-a", "heretic-b", "cancel"])
+    start = content[core.POLL_START]
+    assert start["kind"] == core.POLL_DISCLOSED and start["max_selections"] == 1
+    assert start["question"] == {core.MSC1767_TEXT: "Which preset?", "body": "Which preset?", "msgtype": "m.text"}
+    assert start["answers"] == [{"id": "1", core.MSC1767_TEXT: "heretic-a"}, {"id": "2", core.MSC1767_TEXT: "heretic-b"},
+                                {"id": "3", core.MSC1767_TEXT: "cancel"}]
+    assert content["body"] == content[core.MSC1767_TEXT] == "Which preset?\n1. heretic-a\n2. heretic-b\n3. cancel"
+
+
+def test_poll_end_content_and_parse():
+    assert core.parse_poll_end({"room": "!r:x", "event": "$p", "text": "Done"}) == ("!r:x", "$p", "Done")
+    for bad in ({"room": "!r:x", "event": "p", "text": "x"}, {"room": "!r:x", "event": "$p", "text": ""}):
+        with pytest.raises(core.Refused):
+            core.parse_poll_end(bad)
+    assert core.poll_end_content("$p", "Done") == {"m.relates_to": {"rel_type": "m.reference", "event_id": "$p"},
+                                                   core.POLL_END: {}, core.MSC1767_TEXT: "Done", "body": "Done"}
+
+
+def test_response_answers():
+    ref = {"rel_type": "m.reference", "event_id": "$p"}
+    assert core.response_answers({"m.relates_to": ref, core.POLL_RESPONSE: {"answers": ["2"]}}) == ("$p", ["2"])
+    assert core.response_answers({"m.relates_to": ref, core.POLL_RESPONSE: {"answers": []}}) == ("$p", [])
+    assert core.response_answers({"m.relates_to": ref, core.POLL_RESPONSE: {"answers": [1, "", "x" * 201, "3"]}}) \
+        == ("$p", ["3"])
+    assert core.response_answers({"m.relates_to": ref}) == ("$p", [])
+    assert core.response_answers({"m.relates_to": {"rel_type": "m.thread", "event_id": "$p"}}) == (None, [])
+    assert core.response_answers({"m.relates_to": {"rel_type": "m.reference", "event_id": "p"}}) == (None, [])
+    assert core.response_answers({}) == (None, [])

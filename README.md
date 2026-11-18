@@ -10,7 +10,7 @@ It holds no session state and runs no model or agent. The program behind it is `
 ADR 0027 ("Matrix chat front end for the sessions of the local boxes"). It reuses the pattern of
 [maubot-sbx-approval](https://github.com/d4g/maubot-sbx-approval) (ADR 0024).
 
-**Status:** version 0.10.0 (formatted messages, threads in events, redaction, reactions, notices, typing; 0.8.1: one Megolm session per room again, see "A new key when the owner joins"; 0.9.0: the sub-space Admin; 0.10.0: `POST /image`), tested off-line (logic, and the HTTP endpoints of the real plugin class against maubot 0.6.0 /
+**Status:** version 0.10.0 (formatted messages, threads in events, redaction, reactions, notices, typing; 0.8.1: one Megolm session per room again, see "A new key when the owner joins"; 0.9.0: the sub-space Admin; 0.10.0: `POST /image`; 0.11.0: polls, `POST /poll`, `POST /poll/end` and the owner's votes as events), tested off-line (logic, and the HTTP endpoints of the real plugin class against maubot 0.6.0 /
 mautrix 0.21.1 with a fake Matrix client, routed as maubot routes them). Not yet run against a real homeserver.
 
 ## Design in brief
@@ -69,6 +69,8 @@ signed, stale or replayed request gets `401` without a signature, and `503` whil
 | `POST /avatar` | `{"room", "data"}` — a PNG as base64 (≤ 2 MiB), or `""` to remove | `200 {"avatar"}` — uploaded to the homeserver's media repository (**not encrypted**; only the homeserver's admin can delete it) and set as the avatar of the bot's own member event; the name stays. `400` not a PNG; `403` control room or foreign room; `413` |
 | `POST /roomicon` | `{"room", "data"}` — a PNG as base64 (≤ 2 MiB) | `200 {"icon": true}` — the room's icon (`m.room.avatar`), uploaded like `/avatar` |
 | `POST /archive` | `{"room", "name"}` | `200 {"archived": true}` — renames the room, takes it out of its space, then leaves it; never the control room |
+| `POST /poll` | `{"room", "question", "answers"}` — the control room or a room this plugin made; `question` non-blank, ≤ 4 KiB; `answers` 2 to 20 distinct labels, each 1 to 200 characters without control characters | `201 {"event", "answers"}` — a poll (see "Polls"); `answers` are the answer ids, `"1"` to `"<n>"` in the order given; `403` foreign room; `409` while the owner has not joined a new room (not held); `413`; `502` |
+| `POST /poll/end` | `{"room", "event", "text"}` — `event` the poll's event ID | `200 {"event"}` — the poll is closed with `text` as its closing line; `403` foreign room; `502` |
 
 **Threads in events.** An event carries `thread` when the decrypted content of the owner's text or image message has
 `m.relates_to` with `rel_type` `m.thread` and a string `event_id`: that ID is the thread root. A thread reply also carries a
@@ -128,6 +130,21 @@ uploaded bytes decrypt to the picture); how Element shows it is **not verified**
 timeline event, nothing to edit or redact, it ends by itself when the timeout runs out, and it is scoped to the room (there
 is no thread field). The spec recommends refreshing it every 20 to 30 seconds; `sbx-chat` shows it while a turn runs
 instead of an edited status message (Element X showed those edits late). How clients show a bot's typing is not checked.
+
+**Polls.** Since 0.11.0, so that `sbx-chat` can ask the owner to pick one of several options (an ambiguous command, a
+missing value) instead of a numbered list (agent-sandbox issue #111, homelab ADR 0039 §0a). Built as
+[maubot-sbx-approval](https://github.com/d4g/maubot-sbx-approval) builds its questions, with the unstable MSC3381 event
+types it uses and that Element answers today: `/poll` sends an `org.matrix.msc3381.poll.start`, `kind`
+`org.matrix.msc3381.poll.disclosed`, `max_selections` 1, the question and each answer as `org.matrix.msc1767.text`, and a
+plain fallback `body` with the numbered answers for clients without polls. `/poll/end` sends an
+`org.matrix.msc3381.poll.end` with an `m.reference` to the poll. The plugin keeps no record of its polls. A vote of the owner
+(an `org.matrix.msc3381.poll.response` in a room of this plugin) is queued like a message, as an event with `text` `""` and
+`poll: {"event": <the poll's event ID>, "answers": [<answer ids>]}`; a changed vote is a new event, and an empty `answers` is
+a vote taken back. Matching a vote to its poll, ignoring votes on polls it closed, and ending the poll are the caller's job.
+A vote counts only if it arrived encrypted, checked on the `mautrix` marker as sbx-approval checks it: unlike an
+`m.room.message`, a poll response reaches the plugin as mautrix's decrypted `GenericEvent` with that marker, because maubot
+rewraps only message events. MSC3381 caps a poll at 20 answers, so a caller with a "cancel" answer has 19 for its options.
+Not run against a real homeserver yet; the approval plugin's polls, built the same way, work in Element.
 
 **Events and restarts.** The caller confirms by sending the last sequence number it processed, so a lost answer only
 repeats messages. Every start of the plugin makes a new random `epoch`; a caller that sends another epoch gets all queued
