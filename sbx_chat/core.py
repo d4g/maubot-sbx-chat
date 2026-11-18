@@ -431,6 +431,94 @@ def parse_events(data) -> tuple[str | None, int, float]:
     return epoch, after, float(wait)
 
 
+# --- polls (MSC3381, the unstable names, as maubot-sbx-approval sends and reads them) --------------------------------
+
+POLL_START = "org.matrix.msc3381.poll.start"
+POLL_RESPONSE = "org.matrix.msc3381.poll.response"
+POLL_END = "org.matrix.msc3381.poll.end"
+POLL_DISCLOSED = "org.matrix.msc3381.poll.disclosed"
+MSC1767_TEXT = "org.matrix.msc1767.text"
+# MSC3381 caps a poll at 20 answers; a caller that needs a "cancel" answer has 19 for its options.
+POLL_ANSWERS_MIN, POLL_ANSWERS_MAX = 2, 20
+POLL_QUESTION_MAX = 4 * 1024
+POLL_ANSWER_MAX = 200
+
+
+def parse_poll(data) -> tuple[str, str, list[str]]:
+    """(room, question, answer labels) of /poll. The question is non-blank text up to POLL_QUESTION_MAX bytes; the answers
+    are POLL_ANSWERS_MIN to POLL_ANSWERS_MAX distinct labels, each one line of 1 to POLL_ANSWER_MAX characters."""
+    data = _object(data)
+    room = _room(data)
+    question = data.get("question")
+    if not isinstance(question, str) or not question.strip():
+        raise Refused(400, "bad question")
+    if len(question.encode()) > POLL_QUESTION_MAX:
+        raise Refused(413, "question too long")
+    answers = data.get("answers")
+    if not isinstance(answers, list) or not POLL_ANSWERS_MIN <= len(answers) <= POLL_ANSWERS_MAX:
+        raise Refused(400, f"need {POLL_ANSWERS_MIN} to {POLL_ANSWERS_MAX} answers")
+    for answer in answers:
+        if not isinstance(answer, str) or not answer.strip() or len(answer) > POLL_ANSWER_MAX:
+            raise Refused(400, "bad answer")
+        if any(unicodedata.category(c) in ("Cc", "Cs") for c in answer):
+            raise Refused(400, "bad answer")
+    if len(set(answers)) != len(answers):
+        raise Refused(400, "answers must differ")
+    return room, question, answers
+
+
+def poll_answer_ids(count: int) -> list[str]:
+    """The answer ids of a poll: "1" to "<count>", in the order the caller gave the labels."""
+    return [str(n) for n in range(1, count + 1)]
+
+
+def poll_start_content(question: str, answers: list[str]) -> dict:
+    """An org.matrix.msc3381.poll.start, built like maubot-sbx-approval's: disclosed (results visible), one choice, and a
+    plain-text fallback with the numbered answers for clients without polls."""
+    fallback = question + "\n" + "\n".join(f"{n}. {label}" for n, label in enumerate(answers, 1))
+    return {
+        POLL_START: {
+            "question": {MSC1767_TEXT: question, "body": question, "msgtype": "m.text"},
+            "kind": POLL_DISCLOSED,
+            "max_selections": 1,
+            "answers": [{"id": aid, MSC1767_TEXT: label} for aid, label in zip(poll_answer_ids(len(answers)), answers)],
+        },
+        MSC1767_TEXT: fallback,
+        "body": fallback,
+    }
+
+
+def parse_poll_end(data) -> tuple[str, str, str]:
+    """(room, the poll's event ID, the closing text) of /poll/end."""
+    data = _object(data)
+    return _room(data), _event(data), _text(data)
+
+
+def poll_end_content(event_id: str, text: str) -> dict:
+    return {
+        "m.relates_to": {"rel_type": "m.reference", "event_id": event_id},
+        POLL_END: {},
+        MSC1767_TEXT: text,
+        "body": text,
+    }
+
+
+def response_answers(content: dict) -> tuple[str | None, list[str]]:
+    """The poll a response refers to (its event ID, or None) and the chosen answer ids, as far as they are strings of at most
+    POLL_ANSWER_MAX characters, at most POLL_ANSWERS_MAX of them. An empty list is a vote taken back."""
+    relates = content.get("m.relates_to") or {}
+    if not isinstance(relates, dict) or relates.get("rel_type") != "m.reference":
+        return None, []
+    poll = relates.get("event_id")
+    if not isinstance(poll, str) or not EVENT.fullmatch(poll):
+        return None, []
+    response = content.get(POLL_RESPONSE) or {}
+    answers = response.get("answers") if isinstance(response, dict) else None
+    if not isinstance(answers, list):
+        return poll, []
+    return poll, [a for a in answers if isinstance(a, str) and 0 < len(a) <= POLL_ANSWER_MAX][:POLL_ANSWERS_MAX]
+
+
 # --- the inbound queue --------------------------------------------------------------------------------------------
 
 
@@ -445,15 +533,19 @@ class Inbox:
     seq: int = 0
     items: deque = field(default_factory=lambda: deque(maxlen=QUEUE_MAX))
 
-    def add(self, room: str, text: str, event: str, image: dict | None = None, thread: str | None = None) -> int:
+    def add(self, room: str, text: str, event: str, image: dict | None = None, thread: str | None = None,
+            poll: dict | None = None) -> int:
         """image: {"id", "mime", "size"} of an attachment held in a MediaStore; the text is then its caption.
-        thread: the event ID of the root of the Matrix thread the message was sent in (see thread_of), None outside a thread."""
+        thread: the event ID of the root of the Matrix thread the message was sent in (see thread_of), None outside a thread.
+        poll: {"event", "answers"} of a poll response (see response_answers); the text is then empty."""
         self.seq += 1
         item = {"seq": self.seq, "room": room, "text": text, "event": event}
         if image:
             item["image"] = image
         if thread:
             item["thread"] = thread
+        if poll:
+            item["poll"] = poll
         self.items.append(item)
         return self.seq
 

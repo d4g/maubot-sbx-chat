@@ -9,6 +9,7 @@ import json
 import logging
 import pathlib
 import sys
+import time
 import types
 import urllib.parse
 
@@ -19,7 +20,7 @@ from aiohttp import web  # noqa: E402
 from maubot.matrix import MaubotMessageEvent  # noqa: E402
 from maubot.plugin_server import PluginWebApp, PrefixResource  # noqa: E402
 from mautrix.crypto.attachments import encrypt_attachment  # noqa: E402
-from mautrix.types import Event, EventType, MemberStateEventContent, Membership  # noqa: E402
+from mautrix.types import Event, EventType, MemberStateEventContent, Membership, MessageEvent  # noqa: E402
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import sbx_chat  # noqa: E402
@@ -1210,3 +1211,92 @@ async def test_image_upload_failure_is_a_signed_502(uploads):
     plugin.client.upload_media = broken
     status, body, signed = await call(client, "/image", {"room": SESSION, "data": b64png(OUT_PNG)})
     assert (status, body, signed) == (502, {"error": "could not send the image"}, True) and plugin.client.sent == []
+
+
+def poll_response(plugin, poll, answers, room=CONTROL, sender=OWNER, encrypted=True):
+    """A poll response as mautrix decrypts it and maubot dispatches it: a GenericEvent (mautrix's deserialize_event for an
+    unknown type), which maubot's dispatch_event passes on without rewrapping, with the marker decrypt_megolm sets."""
+    evt = Event.deserialize({"type": core.POLL_RESPONSE, "room_id": room, "event_id": f"$vote{next(_counter)}",
+                             "sender": sender, "origin_server_ts": 1, "content": {
+                                 "m.relates_to": {"rel_type": "m.reference", "event_id": poll},
+                                 core.POLL_RESPONSE: {"answers": answers}}})
+    assert not isinstance(evt, MessageEvent)
+    if encrypted:
+        evt["mautrix"] = {"was_encrypted": True}
+    return evt
+
+
+async def test_poll_is_sent_and_its_answer_ids_returned(setup):
+    plugin, client = setup
+    status, body, signed = await call(client, "/poll", {"room": CONTROL, "question": "Which?",
+                                                        "answers": ["heretic-a", "heretic-b", "cancel"]})
+    assert (status, signed) == (201, True)
+    room, kind, content = plugin.client.sent[-1]
+    assert (room, kind) == (CONTROL, core.POLL_START)
+    assert content == core.poll_start_content("Which?", ["heretic-a", "heretic-b", "cancel"])
+    assert body == {"event": f"$ev{len(plugin.client.sent)}", "answers": ["1", "2", "3"]}
+    status, _, signed = await call(client, "/poll", {"room": SESSION, "question": "q", "answers": ["a", "b"]})
+    assert (status, signed) == (201, True)
+
+
+async def test_poll_refusals(setup):
+    plugin, client = setup
+    assert (await call(client, "/poll", {"room": FOREIGN, "question": "q", "answers": ["a", "b"]}))[0] == 403
+    assert (await call(client, "/poll", {"room": CONTROL, "question": "q", "answers": ["a"]}))[0] == 400
+    assert (await call(client, "/poll", {"room": CONTROL, "question": "q", "answers": ["a", "b"]},
+                       secret="x" * 40))[0] == 401
+    plugin.awaiting[SESSION] = [time.monotonic(), []]
+    status, body, _ = await call(client, "/poll", {"room": SESSION, "question": "q", "answers": ["a", "b"]})
+    assert (status, body) == (409, {"error": "the owner has not joined the room yet"})
+    assert not [s for s in plugin.client.sent if s[1] == core.POLL_START]
+
+
+async def test_poll_failure_is_a_signed_502(setup):
+    plugin, client = setup
+
+    async def broken(room, event_type, content):
+        raise RuntimeError("homeserver down")
+    plugin.client.send_message_event = broken
+    status, body, signed = await call(client, "/poll", {"room": CONTROL, "question": "q", "answers": ["a", "b"]})
+    assert (status, body, signed) == (502, {"error": "could not send the poll"}, True)
+    status, body, signed = await call(client, "/poll/end", {"room": CONTROL, "event": "$p", "text": "x"})
+    assert (status, body, signed) == (502, {"error": "could not end the poll"}, True)
+
+
+async def test_poll_end(setup):
+    plugin, client = setup
+    status, body, signed = await call(client, "/poll/end", {"room": CONTROL, "event": "$p", "text": "Model: heretic-a"})
+    assert (status, signed) == (200, True) and body == {"event": f"$ev{len(plugin.client.sent)}"}
+    assert plugin.client.sent[-1] == (CONTROL, core.POLL_END, core.poll_end_content("$p", "Model: heretic-a"))
+    assert (await call(client, "/poll/end", {"room": FOREIGN, "event": "$p", "text": "x"}))[0] == 403
+    assert (await call(client, "/poll/end", {"room": CONTROL, "event": "p", "text": "x"}))[0] == 400
+
+
+async def test_owner_vote_is_queued_as_a_poll_event(setup):
+    plugin, client = setup
+    await plugin.on_response(poll_response(plugin, "$p1", ["2"]))
+    await plugin.on_response(poll_response(plugin, "$p2", [], room=SESSION))      # a vote taken back
+    status, body, signed = await call(client, "/events", {"wait": 0})
+    assert (status, signed) == (200, True)
+    assert [(e["room"], e["text"], e["poll"]) for e in body["events"]] == [
+        (CONTROL, "", {"event": "$p1", "answers": ["2"]}), (SESSION, "", {"event": "$p2", "answers": []})]
+    assert all(e["event"].startswith("$vote") for e in body["events"])
+
+
+async def test_other_votes_are_ignored(setup):
+    plugin, client = setup
+    await plugin.on_response(poll_response(plugin, "$p", ["1"], sender="@other:example.org"))
+    await plugin.on_response(poll_response(plugin, "$p", ["1"], sender=BOT))
+    await plugin.on_response(poll_response(plugin, "$p", ["1"], room=FOREIGN))
+    await plugin.on_response(poll_response(plugin, "$p", ["1"], encrypted=False))
+    await plugin.on_response(poll_response(plugin, "p", ["1"]))                   # no event ID to refer to
+    assert (await call(client, "/events", {}))[1]["events"] == []
+
+
+async def test_a_vote_wakes_a_waiting_events_call(setup):
+    plugin, client = setup
+    waiting = asyncio.ensure_future(call(client, "/events", {"wait": 10}))
+    await asyncio.sleep(0.2)
+    await plugin.on_response(poll_response(plugin, "$p", ["1"]))
+    status, body, signed = await asyncio.wait_for(waiting, 3)
+    assert body["events"][0]["poll"] == {"event": "$p", "answers": ["1"]} and signed

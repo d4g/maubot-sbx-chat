@@ -19,6 +19,9 @@ from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
 
 from . import core
 
+POLL_START = EventType.find(core.POLL_START, EventType.Class.MESSAGE)
+POLL_RESPONSE = EventType.find(core.POLL_RESPONSE, EventType.Class.MESSAGE)
+POLL_END = EventType.find(core.POLL_END, EventType.Class.MESSAGE)
 # The largest request: a text of core.TEXT_MAX plus the JSON around it.
 BODY_MAX = core.TEXT_MAX + 4 * 1024
 UNSUPPORTED = "Only text and images (PNG, JPEG, WebP, GIF, up to 10 MiB) are supported."
@@ -336,6 +339,45 @@ class SbxChat(Plugin):
         except Exception:
             self.log.exception("react failed")
             return self._reply(await self._nonce_of(request), 502, {"error": "could not react"})
+
+    @web.post("/poll")
+    async def poll(self, request: Request) -> Response:
+        """A poll (MSC3381, one choice, results disclosed) in the control room or a room this plugin made, built as
+        maubot-sbx-approval builds its questions. The answer ids are "1" to "<n>" in the order given and come back in the
+        answer. The plugin keeps no record of the poll: the owner's votes arrive as events with a `poll` field (on_response),
+        and the caller matches them to the polls it sent by the event ID. While the owner has not joined a new room the poll
+        is refused with 409, as /image is: a vote needs the poll to be readable."""
+        try:
+            nonce, data = await self._read(request)
+            room, question, answers = core.parse_poll(data)
+            await self._need_room(room)
+            waiting = self.awaiting.get(room)
+            if waiting is not None and time.monotonic() - waiting[0] <= HOLD_MAX:
+                raise core.Refused(409, "the owner has not joined the room yet")
+            event_id = await self.client.send_message_event(room, POLL_START, core.poll_start_content(question, answers))
+            return self._reply(nonce, 201, {"event": event_id, "answers": core.poll_answer_ids(len(answers))})
+        except core.Refused as error:
+            return self._refused(error)
+        except Exception:
+            self.log.exception("poll failed")
+            return self._reply(await self._nonce_of(request), 502, {"error": "could not send the poll"})
+
+    @web.post("/poll/end")
+    async def poll_end(self, request: Request) -> Response:
+        """End a poll this plugin sent (org.matrix.msc3381.poll.end with an m.reference to it), with a closing text that
+        clients show, such as what was done with the answer. The plugin does not check that the event is one of its polls;
+        MSC3381 has clients ignore an end sent by anyone but the poll's sender."""
+        try:
+            nonce, data = await self._read(request)
+            room, event_id, text = core.parse_poll_end(data)
+            await self._need_room(room)
+            end_id = await self.client.send_message_event(room, POLL_END, core.poll_end_content(event_id, text))
+            return self._reply(nonce, 200, {"event": end_id})
+        except core.Refused as error:
+            return self._refused(error)
+        except Exception:
+            self.log.exception("poll end failed")
+            return self._reply(await self._nonce_of(request), 502, {"error": "could not end the poll"})
 
     @web.post("/room")
     async def room(self, request: Request) -> Response:
@@ -684,6 +726,32 @@ class SbxChat(Plugin):
             return
         async with self.fresh:
             self.inbox.add(evt.room_id, body, evt.event_id, thread=core.thread_of(content))
+            self.fresh.notify_all()
+
+    @event.on(POLL_RESPONSE)
+    async def on_response(self, evt) -> None:
+        """A vote of the owner on a poll in a room of this plugin: queued as an event with `poll: {"event", "answers"}` and
+        an empty text. A changed vote is a new response and a new event; an empty `answers` is a vote taken back. Which poll
+        it belongs to, and whether that poll is still open, is the caller's to decide.
+
+        Encrypted only, checked as maubot-sbx-approval checks its poll responses: on the "mautrix" marker that
+        decrypt_megolm sets (mautrix/crypto/decrypt_megolm.py). A poll response is not an m.room.message: mautrix
+        deserializes it as a GenericEvent (mautrix/types/event/generic.py, deserialize_event), and maubot rewraps only a
+        MessageEvent (maubot/matrix.py, dispatch_event), so the marker is still there."""
+        if evt.sender == self.client.mxid or evt.sender != self.config["owner"]:
+            return
+        if not await self._is_ours(evt.room_id):
+            return
+        marker = evt.get("mautrix") or {}
+        if not marker.get("was_encrypted"):
+            self.log.warning("ignored an unencrypted poll response %s", evt.event_id)
+            return
+        content = evt.content.serialize() if hasattr(evt.content, "serialize") else dict(evt.content)
+        poll, answers = core.response_answers(content)
+        if poll is None:
+            return
+        async with self.fresh:
+            self.inbox.add(evt.room_id, "", evt.event_id, poll={"event": poll, "answers": answers})
             self.fresh.notify_all()
 
     async def _on_image(self, evt, content: dict) -> None:
